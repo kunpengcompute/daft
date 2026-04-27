@@ -10,6 +10,7 @@ pub mod join_operator;
 pub mod left_right_join;
 pub mod outer_join;
 pub mod probe;
+pub mod probe_dedup;
 pub mod sort_merge_join;
 pub mod stats;
 

@@ -222,6 +222,9 @@ def set_execution_config(
     shuffle_aggregation_default_partitions: int | None = None,
     partial_aggregation_threshold: int | None = None,
     high_cardinality_aggregation_threshold: float | None = None,
+    low_cardinality_ndv_ratio_threshold: float | None = None,
+    low_cardinality_min_rows: int | None = None,
+    enable_hash_join_probe_dedup: bool | None = None,
     read_sql_partition_size_bytes: int | None = None,
     default_morsel_size: int | None = None,
     shuffle_algorithm: str | None = None,
@@ -271,6 +274,9 @@ def set_execution_config(
         shuffle_aggregation_default_partitions: Maximum number of partitions to create when performing aggregations on the Ray Runner. Defaults to 200, unless the number of input partitions is less than 200.
         partial_aggregation_threshold: Threshold for performing partial aggregations on the Native Runner. Defaults to 10000 rows.
         high_cardinality_aggregation_threshold: Threshold selectivity for performing high cardinality aggregations on the Native Runner. Defaults to 0.8.
+        low_cardinality_ndv_ratio_threshold: Maximum NDV / num_rows ratio at which a hash-based operator's input is treated as low cardinality. Used by groupby strategy selection and hash join probe-side deduplication. Defaults to 0.05.
+        low_cardinality_min_rows: Minimum sample size (rows) required before the low-cardinality classifier is allowed to fire. Defaults to 4096.
+        enable_hash_join_probe_dedup: When set, the local hash join checks each probe batch for low cardinality and deduplicates repeated keys before probing the build-side hash table. Disabled by default.
         read_sql_partition_size_bytes: Target size of partition when reading from SQL databases. Defaults to 512MB
         default_morsel_size: Default size of morsels used for the new local executor. Defaults to 131072 rows.
         shuffle_algorithm: The shuffle algorithm to use. Defaults to "auto", which will let Daft determine the algorithm. Options are "map_reduce", "pre_shuffle_merge", and "flight_shuffle".
@@ -313,6 +319,9 @@ def set_execution_config(
             shuffle_aggregation_default_partitions=shuffle_aggregation_default_partitions,
             partial_aggregation_threshold=partial_aggregation_threshold,
             high_cardinality_aggregation_threshold=high_cardinality_aggregation_threshold,
+            low_cardinality_ndv_ratio_threshold=low_cardinality_ndv_ratio_threshold,
+            low_cardinality_min_rows=low_cardinality_min_rows,
+            enable_hash_join_probe_dedup=enable_hash_join_probe_dedup,
             read_sql_partition_size_bytes=read_sql_partition_size_bytes,
             default_morsel_size=default_morsel_size,
             shuffle_algorithm=shuffle_algorithm,

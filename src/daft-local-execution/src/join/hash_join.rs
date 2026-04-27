@@ -25,6 +25,7 @@ use crate::{
             finalize_left, finalize_right, probe_left_right, probe_left_right_with_bitmap,
         },
         outer_join::{finalize_outer, probe_outer},
+        probe_dedup::ProbeDedupTuning,
     },
     pipeline::NodeName,
 };
@@ -90,6 +91,11 @@ pub(crate) struct HashJoinParams {
     pub right_schema: SchemaRef,
     pub common_join_cols: IndexSet<String>,
     pub output_schema: SchemaRef,
+    /// Per-batch probe-side deduplication tuning, captured once from the
+    /// execution config. Each `walk_probe_matches`/`walk_probe_exists` call
+    /// inside the inner/left/right/outer/anti/semi probe loops consults this
+    /// to decide whether to engage the dedup fast path.
+    pub probe_dedup: ProbeDedupTuning,
 }
 
 pub struct HashJoinOperator {
@@ -110,6 +116,7 @@ impl HashJoinOperator {
         right_schema: SchemaRef,
         common_join_cols: IndexSet<String>,
         output_schema: SchemaRef,
+        probe_dedup: ProbeDedupTuning,
     ) -> DaftResult<Self> {
         Ok(Self {
             params: Arc::new(HashJoinParams {
@@ -124,6 +131,7 @@ impl HashJoinOperator {
                 right_schema,
                 common_join_cols,
                 output_schema,
+                probe_dedup,
             }),
         })
     }

@@ -109,6 +109,9 @@ impl PyDaftExecutionConfig {
         shuffle_aggregation_default_partitions=None,
         partial_aggregation_threshold=None,
         high_cardinality_aggregation_threshold=None,
+        low_cardinality_ndv_ratio_threshold=None,
+        low_cardinality_min_rows=None,
+        enable_hash_join_probe_dedup=None,
         read_sql_partition_size_bytes=None,
         default_morsel_size=None,
         shuffle_algorithm=None,
@@ -147,6 +150,9 @@ impl PyDaftExecutionConfig {
         shuffle_aggregation_default_partitions: Option<usize>,
         partial_aggregation_threshold: Option<usize>,
         high_cardinality_aggregation_threshold: Option<f64>,
+        low_cardinality_ndv_ratio_threshold: Option<f64>,
+        low_cardinality_min_rows: Option<usize>,
+        enable_hash_join_probe_dedup: Option<bool>,
         read_sql_partition_size_bytes: Option<usize>,
         default_morsel_size: Option<usize>,
         shuffle_algorithm: Option<&str>,
@@ -226,6 +232,15 @@ impl PyDaftExecutionConfig {
         if let Some(high_cardinality_aggregation_threshold) = high_cardinality_aggregation_threshold
         {
             config.high_cardinality_aggregation_threshold = high_cardinality_aggregation_threshold;
+        }
+        if let Some(low_cardinality_ndv_ratio_threshold) = low_cardinality_ndv_ratio_threshold {
+            config.low_cardinality_ndv_ratio_threshold = low_cardinality_ndv_ratio_threshold;
+        }
+        if let Some(low_cardinality_min_rows) = low_cardinality_min_rows {
+            config.low_cardinality_min_rows = low_cardinality_min_rows;
+        }
+        if let Some(enable_hash_join_probe_dedup) = enable_hash_join_probe_dedup {
+            config.enable_hash_join_probe_dedup = enable_hash_join_probe_dedup;
         }
         if let Some(read_sql_partition_size_bytes) = read_sql_partition_size_bytes {
             config.read_sql_partition_size_bytes = read_sql_partition_size_bytes;
@@ -410,6 +425,21 @@ impl PyDaftExecutionConfig {
     #[getter]
     fn get_high_cardinality_aggregation_threshold(&self) -> PyResult<f64> {
         Ok(self.config.high_cardinality_aggregation_threshold)
+    }
+
+    #[getter]
+    fn get_low_cardinality_ndv_ratio_threshold(&self) -> PyResult<f64> {
+        Ok(self.config.low_cardinality_ndv_ratio_threshold)
+    }
+
+    #[getter]
+    fn get_low_cardinality_min_rows(&self) -> PyResult<usize> {
+        Ok(self.config.low_cardinality_min_rows)
+    }
+
+    #[getter]
+    fn get_enable_hash_join_probe_dedup(&self) -> PyResult<bool> {
+        Ok(self.config.enable_hash_join_probe_dedup)
     }
 
     #[getter]

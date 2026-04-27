@@ -1141,6 +1141,7 @@ fn physical_plan_to_pipeline(
                     right_schema.clone(),
                     common_join_cols,
                     schema.clone(),
+                    crate::join::probe_dedup::ProbeDedupTuning::from_exec_config(cfg),
                 )?;
                 let build_child_node = physical_plan_to_pipeline(build_child, cfg, ctx, input_senders)?;
                 let probe_child_node = physical_plan_to_pipeline(probe_child, cfg, ctx, input_senders)?;

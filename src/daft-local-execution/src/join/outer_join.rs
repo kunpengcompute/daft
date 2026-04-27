@@ -12,6 +12,7 @@ use futures::{StreamExt, stream};
 use crate::join::{
     hash_join::{HashJoinParams, HashJoinProbeState},
     index_bitmap::IndexBitmapBuilder,
+    probe_dedup::walk_probe_matches,
 };
 
 pub(crate) async fn merge_bitmaps_and_construct_null_table(
@@ -89,25 +90,37 @@ pub(crate) fn probe_outer(
             let mut probe_side_idxs = Vec::with_capacity(input_table.len());
 
             let join_keys = input_table.eval_expression_list(&params.probe_on)?;
-            let idx_iter = probe_state.probe_indices(&join_keys)?;
-
-            for (probe_row_idx, inner_iter) in idx_iter.enumerate() {
-                if let Some(inner_iter) = inner_iter {
-                    for (build_table_idx, build_row_idx) in inner_iter {
-                        bitmap_builder.mark_used(build_table_idx as usize, build_row_idx as usize);
-                        build_side_growable.extend(
-                            build_table_idx as usize,
-                            build_row_idx as usize,
-                            1,
-                        );
-                        probe_side_idxs.push(probe_row_idx as u64);
+            walk_probe_matches(
+                probe_state,
+                &join_keys,
+                params.probe_dedup,
+                |probe_row_idx, maybe_matches| {
+                    match maybe_matches {
+                        Some(matches) => {
+                            for (build_table_idx, build_row_idx) in matches {
+                                bitmap_builder.mark_used(
+                                    build_table_idx as usize,
+                                    build_row_idx as usize,
+                                );
+                                build_side_growable.extend(
+                                    build_table_idx as usize,
+                                    build_row_idx as usize,
+                                    1,
+                                );
+                                probe_side_idxs.push(probe_row_idx as u64);
+                            }
+                        }
+                        None => {
+                            // No match -> emit the probe row with nulls on
+                            // the build side; outer join finalize emits the
+                            // unmatched build rows symmetrically afterwards.
+                            build_side_growable.add_nulls(1);
+                            probe_side_idxs.push(probe_row_idx as u64);
+                        }
                     }
-                } else {
-                    // if there's no match, we should still emit the probe side and fill the build side with nulls
-                    build_side_growable.add_nulls(1);
-                    probe_side_idxs.push(probe_row_idx as u64);
-                }
-            }
+                    Ok(())
+                },
+            )?;
 
             let build_side_table = build_side_growable.build()?;
             let probe_side_table = {
@@ -285,4 +298,134 @@ pub(crate) async fn finalize_outer(
         Arc::new(vec![final_table]),
         None,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Equivalence tests for the outer-join probe dedup path.
+    //!
+    //! Outer join semantics demand that *every* probe row appears at least
+    //! once in the output (with nulls on the build side when unmatched), and
+    //! the bitmap must accumulate exactly the same marked positions whether
+    //! or not dedup is engaged.
+
+    use daft_core::prelude::{DataType, Field, Int64Array, IntoSeries};
+    use daft_recordbatch::{GrowableRecordBatch, ProbeState, make_probeable_builder};
+
+    use super::*;
+    use crate::join::probe_dedup::{
+        ProbeDedupTuning, test_utils::assert_record_batches_eq_null_safe, walk_probe_matches,
+    };
+
+    fn rb_from_int_col(name: &str, values: Vec<Option<i64>>) -> RecordBatch {
+        let arr = Int64Array::from_iter(Field::new(name, DataType::Int64), values);
+        RecordBatch::from_nonempty_columns(vec![arr.into_series()]).unwrap()
+    }
+
+    fn build_probe_state(build_keys: Vec<Option<i64>>) -> ProbeState {
+        let build_table = rb_from_int_col("k", build_keys);
+        let mut builder = make_probeable_builder(build_table.schema.clone(), None, true).unwrap();
+        builder.add_table(&build_table).unwrap();
+        ProbeState::new(builder.build(), vec![build_table])
+    }
+
+    fn force_dedup() -> ProbeDedupTuning {
+        ProbeDedupTuning {
+            enabled: true,
+            min_rows: 1,
+            unique_ratio_max: 1.0,
+        }
+    }
+
+    fn force_direct() -> ProbeDedupTuning {
+        ProbeDedupTuning::disabled()
+    }
+
+    fn run_outer(
+        probe_state: &ProbeState,
+        join_keys: &RecordBatch,
+        tuning: ProbeDedupTuning,
+    ) -> (Vec<u64>, RecordBatch, IndexBitmapBuilder) {
+        let build_side_tables = probe_state.get_record_batches().iter().collect::<Vec<_>>();
+        let mut growable = GrowableRecordBatch::new(&build_side_tables, true, 8).unwrap();
+        let mut idxs = Vec::new();
+        let mut bitmap_builder = IndexBitmapBuilder::new(probe_state.get_record_batches());
+        walk_probe_matches(
+            probe_state,
+            join_keys,
+            tuning,
+            |probe_row_idx, maybe_matches| {
+                match maybe_matches {
+                    Some(matches) => {
+                        for (build_table_idx, build_row_idx) in matches {
+                            bitmap_builder
+                                .mark_used(build_table_idx as usize, build_row_idx as usize);
+                            growable.extend(
+                                build_table_idx as usize,
+                                build_row_idx as usize,
+                                1,
+                            );
+                            idxs.push(probe_row_idx as u64);
+                        }
+                    }
+                    None => {
+                        growable.add_nulls(1);
+                        idxs.push(probe_row_idx as u64);
+                    }
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        let table = growable.build().unwrap();
+        (idxs, table, bitmap_builder)
+    }
+
+    fn assert_outer_match(probe_state: &ProbeState, join_keys: &RecordBatch) {
+        let (idxs_d, table_d, bm_d) = run_outer(probe_state, join_keys, force_direct());
+        let (idxs_p, table_p, bm_p) = run_outer(probe_state, join_keys, force_dedup());
+        assert_eq!(idxs_d, idxs_p);
+        assert_record_batches_eq_null_safe(&table_d, &table_p);
+        let bools_d: Vec<_> = bm_d.build().convert_to_boolean_arrays().collect();
+        let bools_p: Vec<_> = bm_p.build().convert_to_boolean_arrays().collect();
+        assert_eq!(bools_d.len(), bools_p.len());
+        for (a, b) in bools_d.iter().zip(bools_p.iter()) {
+            assert_eq!(a.len(), b.len());
+            for i in 0..a.len() {
+                assert_eq!(a.get(i), b.get(i), "bitmap divergence at row {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_outer_dedup_repeated_keys() {
+        let probe_state = build_probe_state(vec![Some(10), Some(20), Some(30), Some(20)]);
+        let probe_keys =
+            rb_from_int_col("k", vec![Some(20), Some(10), Some(20), Some(30), Some(20)]);
+        assert_outer_match(&probe_state, &probe_keys);
+    }
+
+    #[test]
+    fn test_outer_dedup_with_unmatched_and_null_probe_keys() {
+        let probe_state = build_probe_state(vec![Some(1), Some(2)]);
+        let probe_keys = rb_from_int_col(
+            "k",
+            vec![Some(1), None, Some(99), Some(2), None, Some(1), Some(99)],
+        );
+        assert_outer_match(&probe_state, &probe_keys);
+    }
+
+    #[test]
+    fn test_outer_dedup_all_unmatched() {
+        let probe_state = build_probe_state(vec![Some(100)]);
+        let probe_keys = rb_from_int_col("k", vec![Some(1), Some(2), Some(1), Some(2)]);
+        assert_outer_match(&probe_state, &probe_keys);
+    }
+
+    #[test]
+    fn test_outer_dedup_heavy_skew() {
+        let probe_state = build_probe_state(vec![Some(7), Some(7), Some(99)]);
+        let probe_keys = rb_from_int_col("k", (0..1000).map(|_| Some(7i64)).collect());
+        assert_outer_match(&probe_state, &probe_keys);
+    }
 }

@@ -2358,6 +2358,9 @@ class PyDaftExecutionConfig:
         shuffle_aggregation_default_partitions: int | None = None,
         partial_aggregation_threshold: int | None = None,
         high_cardinality_aggregation_threshold: float | None = None,
+        low_cardinality_ndv_ratio_threshold: float | None = None,
+        low_cardinality_min_rows: int | None = None,
+        enable_hash_join_probe_dedup: bool | None = None,
         read_sql_partition_size_bytes: int | None = None,
         default_morsel_size: int | None = None,
         shuffle_algorithm: str | None = None,
@@ -2414,6 +2417,12 @@ class PyDaftExecutionConfig:
     def partial_aggregation_threshold(self) -> int: ...
     @property
     def high_cardinality_aggregation_threshold(self) -> float: ...
+    @property
+    def low_cardinality_ndv_ratio_threshold(self) -> float: ...
+    @property
+    def low_cardinality_min_rows(self) -> int: ...
+    @property
+    def enable_hash_join_probe_dedup(self) -> bool: ...
     @property
     def read_sql_partition_size_bytes(self) -> int: ...
     @property
