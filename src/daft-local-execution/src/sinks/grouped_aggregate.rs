@@ -1,7 +1,4 @@
-use std::{
-    collections::HashSet,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use common_daft_config::DaftExecutionConfig;
 use common_error::DaftResult;
@@ -20,15 +17,52 @@ use super::blocking_sink::{
 };
 use crate::{
     ExecutionTaskSpawner,
+    cardinality::CardinalityProfile,
     pipeline::{InputId, NodeName},
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AggStrategy {
     // TODO: This would probably benefit from doing sharded aggs.
     AggThenPartition,
     PartitionThenAgg(usize),
     PartitionOnly,
+}
+
+/// Build a `CardinalityProfile` from the row hashes of one or more record
+/// batches forming a single morsel's group-key view.
+///
+/// Hashes are computed at most once per row and forwarded to the profile
+/// builder as an `Option<u64>` stream so that null group keys are correctly
+/// excluded from the NDV count.
+fn profile_record_batches(
+    batches: &[daft_recordbatch::RecordBatch],
+) -> DaftResult<CardinalityProfile> {
+    // Pre-compute the per-batch hashes so we can stream `Option<u64>` items
+    // without allocating intermediate vectors per batch.
+    let hashes_per_batch = batches
+        .iter()
+        .map(|t| t.hash_rows())
+        .collect::<DaftResult<Vec<_>>>()?;
+    let iter = hashes_per_batch.iter().flat_map(|arr| arr.iter());
+    Ok(CardinalityProfile::from_hashes(iter))
+}
+
+/// Pick the aggregation strategy for a single morsel given its cardinality
+/// profile. Preserves the existing semantic: when `ndv_ratio` exceeds the
+/// configured high-cardinality threshold we go partition-first, otherwise we
+/// fall back to the agg-then-partition path that benefits from heavy reuse of
+/// repeated group keys.
+pub(crate) fn decide_agg_strategy(
+    profile: &CardinalityProfile,
+    high_cardinality_threshold_ratio: f64,
+    partial_agg_threshold: usize,
+) -> AggStrategy {
+    if profile.ndv_ratio >= high_cardinality_threshold_ratio {
+        AggStrategy::PartitionThenAgg(partial_agg_threshold)
+    } else {
+        AggStrategy::AggThenPartition
+    }
 }
 
 impl AggStrategy {
@@ -189,27 +223,15 @@ impl GroupedAggregateState {
             return Ok(global_strat.clone());
         }
 
-        // Else determine the strategy.
+        // Else determine the strategy from the cardinality profile of this morsel's
+        // group keys. The previous implementation collected all hashes into a
+        // HashSet just to count distinct values; the unified `CardinalityProfile`
+        // performs the same job and additionally exposes `top1_ratio`, which we
+        // can leverage in follow-up skew-aware optimizations.
         let groupby = input.eval_expression_list(params.group_by.as_slice())?;
-
-        let groupkey_hashes = groupby
-            .record_batches()
-            .iter()
-            .map(|t| t.hash_rows())
-            .collect::<DaftResult<Vec<_>>>()?;
-        let estimated_num_groups = groupkey_hashes
-            .iter()
-            .flatten()
-            .collect::<HashSet<_>>()
-            .len();
-
-        let decided_strategy = if estimated_num_groups as f64 / input.len() as f64
-            >= high_cardinality_threshold_ratio
-        {
-            AggStrategy::PartitionThenAgg(partial_agg_threshold)
-        } else {
-            AggStrategy::AggThenPartition
-        };
+        let profile = profile_record_batches(groupby.record_batches())?;
+        let decided_strategy =
+            decide_agg_strategy(&profile, high_cardinality_threshold_ratio, partial_agg_threshold);
 
         *local_strategy_cache = Some(decided_strategy.clone());
         *global_strategy = Some(decided_strategy.clone());
@@ -447,5 +469,85 @@ impl BlockingSink for GroupedAggregateSink {
             self.partial_agg_threshold,
             self.high_cardinality_threshold_ratio,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Integration tests for the cardinality-aware strategy router.
+    //!
+    //! These tests pin down the contract that `determine_agg_strategy` used to
+    //! enforce with its inline `HashSet` counter:
+    //! - high `ndv_ratio` -> `PartitionThenAgg`
+    //! - low `ndv_ratio`  -> `AggThenPartition`
+    //!
+    //! They additionally exercise the threshold boundary, which the previous
+    //! implementation only covered indirectly through end-to-end aggregation
+    //! tests.
+
+    use super::*;
+    use crate::cardinality::CardinalityProfile;
+
+    fn profile_with_ratio(num_rows: usize, num_distinct: usize) -> CardinalityProfile {
+        let hashes = (0..num_rows).map(|i| Some((i % num_distinct.max(1)) as u64));
+        CardinalityProfile::from_hashes(hashes)
+    }
+
+    #[test]
+    fn test_decide_agg_strategy_low_cardinality_picks_agg_then_partition() {
+        // 1000 rows, 10 distinct -> ratio 0.01 (well below default 0.8)
+        let profile = profile_with_ratio(1000, 10);
+        let strategy = decide_agg_strategy(&profile, 0.8, 10_000);
+        assert_eq!(strategy, AggStrategy::AggThenPartition);
+    }
+
+    #[test]
+    fn test_decide_agg_strategy_high_cardinality_picks_partition_then_agg() {
+        // 1000 rows, 1000 distinct -> ratio 1.0 (>= 0.8)
+        let profile = profile_with_ratio(1000, 1000);
+        let strategy = decide_agg_strategy(&profile, 0.8, 10_000);
+        assert_eq!(strategy, AggStrategy::PartitionThenAgg(10_000));
+    }
+
+    #[test]
+    fn test_decide_agg_strategy_threshold_inclusive() {
+        // Build a profile whose ndv_ratio is exactly 0.5 by construction.
+        let profile = profile_with_ratio(1000, 500);
+        assert!((profile.ndv_ratio - 0.5).abs() < 1e-9);
+        // At threshold 0.5 the decision must flip into PartitionThenAgg (>=).
+        assert_eq!(
+            decide_agg_strategy(&profile, 0.5, 42),
+            AggStrategy::PartitionThenAgg(42)
+        );
+        // Just above threshold -> still PartitionThenAgg
+        assert_eq!(
+            decide_agg_strategy(&profile, 0.49, 42),
+            AggStrategy::PartitionThenAgg(42)
+        );
+        // Just below threshold -> AggThenPartition
+        assert_eq!(
+            decide_agg_strategy(&profile, 0.51, 42),
+            AggStrategy::AggThenPartition
+        );
+    }
+
+    #[test]
+    fn test_decide_agg_strategy_propagates_partial_agg_threshold() {
+        let profile = profile_with_ratio(100, 100); // ratio 1.0
+        let strategy = decide_agg_strategy(&profile, 0.8, 1234);
+        assert_eq!(strategy, AggStrategy::PartitionThenAgg(1234));
+    }
+
+    #[test]
+    fn test_decide_agg_strategy_empty_input_low_cardinality_default() {
+        // An empty profile has ndv_ratio == 0.0; we must NOT classify the
+        // empty input as high-cardinality (which would trigger the heavier
+        // PartitionThenAgg path on a no-op morsel).
+        let profile = CardinalityProfile::default();
+        assert_eq!(profile.ndv_ratio, 0.0);
+        assert_eq!(
+            decide_agg_strategy(&profile, 0.8, 10_000),
+            AggStrategy::AggThenPartition
+        );
     }
 }
