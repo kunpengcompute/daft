@@ -1583,3 +1583,114 @@ def test_self_join_with_projection():
     }
 
     assert pa.Table.from_pydict(result_df.to_pydict()) == pa.Table.from_pydict(expected)
+
+
+# ---------------------------------------------------------------------------
+# Hash-join probe-side deduplication equivalence (low-cardinality optimization)
+# ---------------------------------------------------------------------------
+#
+# These tests pin down the contract of the
+# `enable_hash_join_probe_dedup` execution-config flag: turning the
+# optimization on must produce **byte-identical** join output (after sort)
+# compared to the legacy direct-probe path, across every supported join type
+# and over inputs deliberately chosen to exercise the low-cardinality fast
+# path:
+#
+#  * The probe side replays a small set of distinct keys many times so the
+#    `unique_ratio` is well below the default `low_cardinality_ndv_ratio`
+#    threshold (0.05) and the dedup path engages.
+#  * The build side carries one row per distinct key plus extra rows for a
+#    subset of "popular" keys, so the cross-product fan-out exercises the
+#    `walk_probe_matches` expansion logic on multiple matches per probe row.
+#  * Probe keys that have no match in the build side, plus an injected
+#    `null` group, exercise the "no match" branch of every join type
+#    (left/right/outer null padding; anti/semi existence semantics).
+#
+# Tests run with the native runner (where the probe-dedup path lives); they
+# are skipped on Ray which routes through a different join executor.
+
+
+_LOW_CARD_DISTINCT_BUILD_KEYS = list(range(8))  # 0..7
+_LOW_CARD_DISTINCT_PROBE_KEYS = list(range(10))  # 0..9 (8/9 unmatched)
+_LOW_CARD_PROBE_REPS = 200  # ~2000 probe rows total -> unique_ratio ≈ 0.005
+
+
+def _low_cardinality_join_inputs() -> tuple[dict[str, list], dict[str, list]]:
+    """Construct a deterministic low-cardinality build/probe pair.
+
+    Returns ``(build_pydict, probe_pydict)`` where:
+      * build has 1 row for every key in [0..7] plus 2 extra rows for keys
+        {0, 3, 5} so probe matches can fan out to 3 rows each.
+      * probe replays [0..9] x N + a single ``None`` so we cover every code
+        path: matched (one or many), unmatched (no match), and null key.
+    """
+    build_keys = list(_LOW_CARD_DISTINCT_BUILD_KEYS)
+    build_keys += [0, 0, 3, 3, 5, 5]  # dup-fanout keys
+    build_payloads = [f"b{k}-{i}" for i, k in enumerate(build_keys)]
+    build = {"k": build_keys, "build_val": build_payloads}
+
+    probe_keys: list[int | None] = []
+    probe_payloads: list[str] = []
+    for rep in range(_LOW_CARD_PROBE_REPS):
+        for k in _LOW_CARD_DISTINCT_PROBE_KEYS:
+            probe_keys.append(k)
+            probe_payloads.append(f"p{k}-{rep}")
+    probe_keys.append(None)
+    probe_payloads.append("p-null")
+    probe = {"k": probe_keys, "probe_val": probe_payloads}
+    return build, probe
+
+
+def _run_low_card_join(join_type: str, *, dedup_enabled: bool) -> dict[str, list]:
+    """Run a hash join over the low-cardinality fixture under the given
+    config. Returns a sort-stable dict so it can be compared regardless of
+    the underlying probe-side row ordering."""
+    build_pydict, probe_pydict = _low_cardinality_join_inputs()
+    with daft.execution_config_ctx(
+        enable_hash_join_probe_dedup=dedup_enabled,
+        # Tighten the low-card gates to reliably engage on the fixture above.
+        low_cardinality_ndv_ratio_threshold=0.05,
+        low_cardinality_min_rows=128,
+    ):
+        build_df = daft.from_pydict(build_pydict)
+        probe_df = daft.from_pydict(probe_pydict)
+        joined = probe_df.join(build_df, on="k", how=join_type, strategy="hash")
+        return joined.to_pydict()
+
+
+@pytest.mark.skipif(
+    get_tests_daft_runner_name() != "native",
+    reason="probe-side dedup is implemented in the native local executor",
+)
+@pytest.mark.parametrize(
+    "join_type",
+    ["inner", "left", "right", "outer", "anti", "semi"],
+)
+def test_low_cardinality_probe_dedup_equivalence(join_type):
+    """Output must be identical with and without probe-side deduplication."""
+    direct = _run_low_card_join(join_type, dedup_enabled=False)
+    dedup = _run_low_card_join(join_type, dedup_enabled=True)
+
+    # Schema sanity: same set of columns in the same order.
+    assert list(direct.keys()) == list(dedup.keys()), (
+        f"column layout drift for join_type={join_type}: "
+        f"direct={list(direct.keys())} dedup={list(dedup.keys())}"
+    )
+    # Row count must agree exactly. This catches accidental row drops or
+    # double-counting in the dedup expansion.
+    direct_len = len(next(iter(direct.values()))) if direct else 0
+    dedup_len = len(next(iter(dedup.values()))) if dedup else 0
+    assert direct_len == dedup_len, (
+        f"row count drift for join_type={join_type}: "
+        f"direct={direct_len} dedup={dedup_len}"
+    )
+
+    # Order is implementation-defined for hash joins, so compare on a sorted
+    # arrow table over every output column to make the equivalence robust.
+    sort_keys = list(direct.keys())
+    direct_tbl = sort_arrow_table(pa.Table.from_pydict(direct), *sort_keys)
+    dedup_tbl = sort_arrow_table(pa.Table.from_pydict(dedup), *sort_keys)
+    assert direct_tbl == dedup_tbl, (
+        f"probe-dedup output diverged for join_type={join_type}\n"
+        f"direct={direct_tbl}\ndedup={dedup_tbl}"
+    )
