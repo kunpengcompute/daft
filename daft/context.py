@@ -225,6 +225,7 @@ def set_execution_config(
     low_cardinality_ndv_ratio_threshold: float | None = None,
     low_cardinality_min_rows: int | None = None,
     enable_hash_join_probe_dedup: bool | None = None,
+    high_cardinality_skew_threshold: float | None = None,
     read_sql_partition_size_bytes: int | None = None,
     default_morsel_size: int | None = None,
     shuffle_algorithm: str | None = None,
@@ -277,6 +278,7 @@ def set_execution_config(
         low_cardinality_ndv_ratio_threshold: Maximum NDV / num_rows ratio at which a hash-based operator's input is treated as low cardinality. Used by groupby strategy selection and hash join probe-side deduplication. Defaults to 0.05.
         low_cardinality_min_rows: Minimum sample size (rows) required before the low-cardinality classifier is allowed to fire. Defaults to 4096.
         enable_hash_join_probe_dedup: When set, the local hash join checks each probe batch for low cardinality and deduplicates repeated keys before probing the build-side hash table. Disabled by default.
+        high_cardinality_skew_threshold: Skew-aware fallback threshold for the groupby strategy router. When the hottest group key dominates more than this fraction of the (non-null) sample rows, the router falls back to ``AggThenPartition`` even if ``ndv_ratio`` would otherwise pick ``PartitionThenAgg``. Setting this strictly above ``1.0`` disables the override. Defaults to 0.5.
         read_sql_partition_size_bytes: Target size of partition when reading from SQL databases. Defaults to 512MB
         default_morsel_size: Default size of morsels used for the new local executor. Defaults to 131072 rows.
         shuffle_algorithm: The shuffle algorithm to use. Defaults to "auto", which will let Daft determine the algorithm. Options are "map_reduce", "pre_shuffle_merge", and "flight_shuffle".
@@ -322,6 +324,7 @@ def set_execution_config(
             low_cardinality_ndv_ratio_threshold=low_cardinality_ndv_ratio_threshold,
             low_cardinality_min_rows=low_cardinality_min_rows,
             enable_hash_join_probe_dedup=enable_hash_join_probe_dedup,
+            high_cardinality_skew_threshold=high_cardinality_skew_threshold,
             read_sql_partition_size_bytes=read_sql_partition_size_bytes,
             default_morsel_size=default_morsel_size,
             shuffle_algorithm=shuffle_algorithm,

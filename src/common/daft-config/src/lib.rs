@@ -138,6 +138,13 @@ pub struct DaftExecutionConfig {
     /// probe batch is detected as low cardinality, repeated keys are probed
     /// once and results are expanded back to the original row layout.
     pub enable_hash_join_probe_dedup: bool,
+    /// Skew-aware override for the high-cardinality groupby path. If a single
+    /// group key dominates more than this fraction of the (non-null) sample
+    /// rows, the strategy router falls back to `AggThenPartition` even when
+    /// `ndv_ratio` would otherwise suggest `PartitionThenAgg`. Setting this
+    /// strictly above `1.0` disables the override (since `top1_ratio` is
+    /// bounded by `1.0`).
+    pub high_cardinality_skew_threshold: f64,
     pub read_sql_partition_size_bytes: usize,
     pub default_morsel_size: NonZeroUsize,
     pub shuffle_algorithm: String,
@@ -188,6 +195,7 @@ impl Default for DaftExecutionConfig {
             low_cardinality_ndv_ratio_threshold: 0.05,
             low_cardinality_min_rows: 4096,
             enable_hash_join_probe_dedup: false,
+            high_cardinality_skew_threshold: 0.5,
             read_sql_partition_size_bytes: 512 * 1024 * 1024, // 512MB
             default_morsel_size: NonZeroUsize::new(128 * 1024).unwrap(),
             shuffle_algorithm: "auto".to_string(),
