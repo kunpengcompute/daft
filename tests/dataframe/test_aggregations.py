@@ -1191,3 +1191,130 @@ def test_groupby_agg_concat_list_with_delimiter_raises(make_df):
     with pytest.raises(Exception) as exc_info:
         df.groupby("b").string_agg("a", delimiter=",").collect()
     assert "Concat Agg delimiter is only supported for Utf8 types" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# Skew-aware groupby strategy router (low-cardinality optimization)
+# ---------------------------------------------------------------------------
+#
+# These tests validate the contract of `high_cardinality_skew_threshold`:
+# the strategy router may pick `AggThenPartition` when one group key
+# dominates the input (controlled by `top1_ratio` against the threshold),
+# but the *user-visible aggregate result* must be identical regardless of
+# whether the skew gate fired or not. This is the same correctness
+# invariant the in-process Rust unit tests cover for the decision matrix;
+# here we run it end-to-end through the native sink to catch wiring bugs.
+#
+# We use:
+#   * a heavily skewed input: ~95% of rows on a single hot key, the rest
+#     spread across many cold keys -> top1_ratio ≈ 0.95 (forces the skew
+#     branch under threshold 0.5),
+#   * a high-cardinality (`ndv_ratio` well above 0.05) shape so that
+#     *only* the skew gate can move the decision off `PartitionThenAgg`.
+#
+# The result of the groupby must match between:
+#   (a) skew threshold = 0.5  -> skew override engages, AggThenPartition
+#   (b) skew threshold > 1.0  -> override disabled, PartitionThenAgg
+# ensuring functional equivalence across both code paths.
+
+
+_SKEW_HOT_KEY = 0
+_SKEW_TOTAL_ROWS = 20_000  # well above default low_cardinality_min_rows
+_SKEW_HOT_FRACTION = 0.95  # top1_ratio ≈ 0.95
+
+
+def _make_skewed_groupby_df():
+    """Build a deterministic, heavily skewed groupby fixture."""
+    hot_count = int(_SKEW_TOTAL_ROWS * _SKEW_HOT_FRACTION)
+    cold_count = _SKEW_TOTAL_ROWS - hot_count
+    keys: list[int] = [_SKEW_HOT_KEY] * hot_count
+    keys += [(1 + i) for i in range(cold_count)]
+    values = list(range(_SKEW_TOTAL_ROWS))
+    return daft.from_pydict({"k": keys, "v": values})
+
+
+def _run_skewed_groupby(skew_threshold: float) -> dict[str, list]:
+    """Run groupby/sum/count under the requested skew threshold."""
+    with daft.execution_config_ctx(
+        high_cardinality_skew_threshold=skew_threshold,
+        # Keep the default low-card threshold; this fixture is high-card
+        # so only the skew gate can flip the strategy.
+        low_cardinality_ndv_ratio_threshold=0.05,
+        low_cardinality_min_rows=4096,
+    ):
+        return (
+            _make_skewed_groupby_df()
+            .groupby("k")
+            .agg(col("v").sum().alias("sum_v"), col("v").count().alias("count_v"))
+            .to_pydict()
+        )
+
+
+@pytest.mark.skipif(
+    get_tests_daft_runner_name() != "native",
+    reason="grouped-aggregate strategy router lives in the native local sink",
+)
+def test_groupby_skew_threshold_equivalence_engaged_vs_disabled():
+    """Output must be identical whether the skew override engages or not."""
+    engaged = _run_skewed_groupby(skew_threshold=0.5)
+    disabled = _run_skewed_groupby(skew_threshold=1.5)
+
+    # Same set of columns.
+    assert list(engaged.keys()) == list(disabled.keys()) == ["k", "sum_v", "count_v"]
+
+    # Same row count: one row per distinct group key.
+    assert len(engaged["k"]) == len(disabled["k"])
+
+    # Order is implementation-defined under groupby; sort and compare.
+    engaged_tbl = sort_arrow_table(pa.Table.from_pydict(engaged), "k")
+    disabled_tbl = sort_arrow_table(pa.Table.from_pydict(disabled), "k")
+    assert engaged_tbl == disabled_tbl, (
+        f"skew-aware groupby diverged from baseline\n"
+        f"engaged={engaged_tbl}\ndisabled={disabled_tbl}"
+    )
+
+    # Cross-check the hot-key partial: it should sum exactly the contiguous
+    # prefix [0, hot_count) of the value range.
+    hot_count = int(_SKEW_TOTAL_ROWS * _SKEW_HOT_FRACTION)
+    expected_hot_sum = (hot_count - 1) * hot_count // 2
+    engaged_pydict = engaged_tbl.to_pydict()
+    hot_idx = engaged_pydict["k"].index(_SKEW_HOT_KEY)
+    assert engaged_pydict["sum_v"][hot_idx] == expected_hot_sum
+    assert engaged_pydict["count_v"][hot_idx] == hot_count
+
+
+@pytest.mark.skipif(
+    get_tests_daft_runner_name() != "native",
+    reason="grouped-aggregate strategy router lives in the native local sink",
+)
+def test_groupby_skew_threshold_uniform_input_unaffected():
+    """A uniformly-distributed (non-skewed) input must yield identical
+    results regardless of the skew threshold value: nothing crosses the
+    `top1_ratio > threshold` gate, so both runs go through the same
+    `PartitionThenAgg` path."""
+    n_rows = 20_000
+    n_keys = 200  # ndv_ratio = 0.01 -> still below low-card threshold 0.05?
+    # We want the high-cardinality branch active to isolate the skew gate.
+    # With ndv_ratio = 0.01 the low-card branch dominates regardless. Boost
+    # ndv to make ratio cross the high-cardinality threshold.
+    n_keys = 4_000  # ndv_ratio = 0.2 > 0.05 high-card threshold -> PartitionThenAgg
+    keys = [(i % n_keys) for i in range(n_rows)]
+    values = list(range(n_rows))
+    df = daft.from_pydict({"k": keys, "v": values})
+
+    def run(skew_threshold: float):
+        with daft.execution_config_ctx(
+            high_cardinality_skew_threshold=skew_threshold,
+            low_cardinality_ndv_ratio_threshold=0.05,
+            low_cardinality_min_rows=4096,
+        ):
+            return df.groupby("k").agg(col("v").sum().alias("sum_v")).to_pydict()
+
+    tight = run(skew_threshold=0.001)
+    loose = run(skew_threshold=1.5)
+    tight_tbl = sort_arrow_table(pa.Table.from_pydict(tight), "k")
+    loose_tbl = sort_arrow_table(pa.Table.from_pydict(loose), "k")
+    assert tight_tbl == loose_tbl, (
+        f"uniform groupby drift across skew thresholds:\n"
+        f"tight={tight_tbl}\nloose={loose_tbl}"
+    )

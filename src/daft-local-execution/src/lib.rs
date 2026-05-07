@@ -2,6 +2,7 @@
 
 mod batch_manager;
 mod buffer;
+mod cardinality;
 mod channel;
 mod concat;
 mod dynamic_batching;
