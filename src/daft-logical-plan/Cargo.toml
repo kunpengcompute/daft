@@ -1,0 +1,69 @@
+[dependencies]
+common-daft-config = {path = "../common/daft-config", default-features = false}
+common-display = {path = "../common/display", default-features = false}
+common-error = {path = "../common/error", default-features = false}
+common-file-formats = {path = "../common/file-formats", default-features = false}
+common-hashable-float-wrapper = {path = "../common/hashable-float-wrapper", default-features = false}
+common-io-config = {path = "../common/io-config", default-features = false}
+common-partitioning = {path = "../common/partitioning", default-features = false}
+common-py-serde = {path = "../common/py-serde", default-features = false}
+common-resource-request = {path = "../common/resource-request", default-features = false}
+common-treenode = {path = "../common/treenode", default-features = false}
+daft-algebra = {path = "../daft-algebra", default-features = false}
+daft-core = {path = "../daft-core", default-features = false}
+daft-dsl = {path = "../daft-dsl", default-features = false}
+daft-functions = {path = "../daft-functions", default-features = false}
+daft-scan = {path = "../daft-scan", default-features = false}
+daft-functions-list = {path = "../daft-functions-list", default-features = false}
+daft-functions-uri = {path = "../daft-functions-uri", default-features = false}
+daft-recordbatch = {path = "../daft-recordbatch", default-features = false}
+daft-schema = {path = "../daft-schema", default-features = false}
+educe = {workspace = true}
+indexmap = {workspace = true}
+itertools = {workspace = true}
+log = {workspace = true}
+num-format = {workspace = true}
+pyo3 = {workspace = true, optional = true}
+serde = {workspace = true, features = ["rc"]}
+snafu = {workspace = true}
+tokio = {workspace = true}
+serde_json.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+daft-dsl = {path = "../daft-dsl", features = ["test-utils"]}
+daft-functions-utf8 = {path = "../daft-functions-utf8", default-features = false}
+indoc = "2"
+pretty_assertions = {workspace = true}
+rand = {workspace = true}
+rstest = {workspace = true}
+test-log = {workspace = true}
+
+[features]
+python = [
+  "dep:pyo3",
+  "common-display/python",
+  "common-error/python",
+  "common-io-config/python",
+  "common-daft-config/python",
+  "common-py-serde/python",
+  "common-resource-request/python",
+  "common-partitioning/python",
+  "daft-core/python",
+  "daft-dsl/python",
+  "daft-functions/python",
+  "daft-functions-list/python",
+  "daft-scan/python",
+  "daft-schema/python"
+]
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[package]
+edition = {workspace = true}
+name = "daft-logical-plan"
+version = {workspace = true}

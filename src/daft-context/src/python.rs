@@ -1,0 +1,362 @@
+use std::{collections::HashMap, sync::Arc};
+
+use common_daft_config::{PyDaftExecutionConfig, PyDaftPlanningConfig};
+use common_metrics::QueryEndState;
+use daft_core::python::PySchema;
+use daft_micropartition::python::PyMicroPartition;
+use pyo3::prelude::*;
+
+use crate::{
+    DaftContext, subscribers,
+    subscribers::{QueryMetadata, QueryResult},
+};
+
+#[pyclass(frozen, from_py_object)]
+#[derive(Clone)]
+pub struct PyQueryMetadata(pub(crate) Arc<QueryMetadata>);
+
+#[pymethods]
+impl PyQueryMetadata {
+    #[new]
+    #[pyo3(signature = (output_schema, unoptimized_plan, runner, ray_dashboard_url=None, entrypoint=None, python_version=None, daft_version=None, ray_version=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn __new__(
+        output_schema: PySchema,
+        unoptimized_plan: &str,
+        runner: &str,
+        ray_dashboard_url: Option<String>,
+        entrypoint: Option<String>,
+        python_version: Option<String>,
+        daft_version: Option<String>,
+        ray_version: Option<String>,
+    ) -> Self {
+        Self(Arc::new(QueryMetadata {
+            output_schema: output_schema.into(),
+            unoptimized_plan: unoptimized_plan.into(),
+            runner: runner.into(),
+            ray_dashboard_url,
+            entrypoint,
+            python_version,
+            daft_version,
+            ray_version,
+        }))
+    }
+    #[getter]
+    pub fn output_schema(&self) -> PySchema {
+        self.0.output_schema.clone().into()
+    }
+    #[getter]
+    pub fn unoptimized_plan(&self) -> String {
+        self.0.unoptimized_plan.to_string()
+    }
+    #[getter]
+    pub fn runner(&self) -> String {
+        self.0.runner.clone()
+    }
+    #[getter]
+    pub fn ray_dashboard_url(&self) -> Option<String> {
+        self.0.ray_dashboard_url.clone()
+    }
+    #[getter]
+    pub fn entrypoint(&self) -> Option<String> {
+        self.0.entrypoint.clone()
+    }
+    #[getter]
+    pub fn python_version(&self) -> Option<String> {
+        self.0.python_version.clone()
+    }
+    #[getter]
+    pub fn daft_version(&self) -> Option<String> {
+        self.0.daft_version.clone()
+    }
+    #[getter]
+    pub fn ray_version(&self) -> Option<String> {
+        self.0.ray_version.clone()
+    }
+}
+
+#[pyclass(frozen, from_py_object)]
+#[derive(Clone, Debug)]
+pub struct PyQueryResult(pub(crate) Arc<QueryResult>);
+
+#[pymethods]
+impl PyQueryResult {
+    // Query Result contains the final state of a query, and if there is any error, contains an error message
+    #[new]
+    #[pyo3(signature = (end_state, error_message))]
+    fn __new__(end_state: QueryEndState, error_message: Option<String>) -> Self {
+        Self(Arc::new(QueryResult {
+            end_state,
+            error_message,
+        }))
+    }
+    #[getter]
+    pub fn end_state(&self) -> QueryEndState {
+        self.0.end_state.clone().into()
+    }
+    #[getter]
+    pub fn error_message(&self) -> Option<String> {
+        self.0.error_message.clone()
+    }
+}
+
+impl From<Arc<QueryMetadata>> for PyQueryMetadata {
+    fn from(metadata: Arc<QueryMetadata>) -> Self {
+        Self(metadata)
+    }
+}
+
+impl From<PyQueryMetadata> for Arc<QueryMetadata> {
+    fn from(metadata: PyQueryMetadata) -> Self {
+        metadata.0
+    }
+}
+
+impl<'a> From<&'a PyQueryMetadata> for &'a Arc<QueryMetadata> {
+    fn from(ctx: &'a PyQueryMetadata) -> Self {
+        &ctx.0
+    }
+}
+
+#[pyfunction]
+pub fn refresh_dashboard_subscriber() -> PyResult<()> {
+    let ctx = crate::get_context();
+    // Try to create the dashboard subscriber
+    // We assume the env var DAFT_DASHBOARD_URL is set
+    match crate::subscribers::dashboard::DashboardSubscriber::try_new() {
+        Ok(Some(subscriber)) => {
+            // Attach it to the context
+            ctx.attach_subscriber("_dashboard".to_string(), Arc::new(subscriber));
+            Ok(())
+        }
+        Ok(None) => {
+            // Environment variable not set, or failed to create
+            Ok(())
+        }
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Failed to create dashboard subscriber: {}",
+            e
+        ))),
+    }
+}
+
+impl From<Arc<QueryResult>> for PyQueryResult {
+    fn from(result: Arc<QueryResult>) -> Self {
+        Self(result)
+    }
+}
+
+impl From<PyQueryResult> for Arc<QueryResult> {
+    fn from(result: PyQueryResult) -> Self {
+        result.0
+    }
+}
+
+impl From<PyQueryResult> for QueryResult {
+    fn from(result: PyQueryResult) -> Self {
+        (*result.0).clone()
+    }
+}
+
+impl From<QueryResult> for PyQueryResult {
+    fn from(result: QueryResult) -> Self {
+        Self(Arc::new(result))
+    }
+}
+
+#[pyclass(frozen)]
+pub struct PyDaftContext {
+    inner: DaftContext,
+}
+
+impl Default for PyDaftContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[pymethods]
+impl PyDaftContext {
+    #[new]
+    pub fn new() -> Self {
+        Self {
+            inner: crate::get_context(),
+        }
+    }
+
+    #[getter(_daft_execution_config)]
+    pub fn get_daft_execution_config(&self, py: Python) -> PyResult<PyDaftExecutionConfig> {
+        let config = py.detach(|| self.inner.execution_config());
+        let config = PyDaftExecutionConfig { config };
+        Ok(config)
+    }
+
+    #[getter(_daft_planning_config)]
+    pub fn get_daft_planning_config(&self, py: Python) -> PyResult<PyDaftPlanningConfig> {
+        let config = py.detach(|| self.inner.planning_config());
+        let config = PyDaftPlanningConfig { config };
+        Ok(config)
+    }
+
+    #[setter(_daft_execution_config)]
+    pub fn set_daft_execution_config(&self, py: Python, config: PyDaftExecutionConfig) {
+        py.detach(|| self.inner.set_execution_config(config.config));
+    }
+
+    #[setter(_daft_planning_config)]
+    pub fn set_daft_planning_config(&self, py: Python, config: PyDaftPlanningConfig) {
+        py.detach(|| self.inner.set_planning_config(config.config));
+    }
+
+    pub fn attach_subscriber(&self, py: Python, alias: String, subscriber: Py<PyAny>) {
+        py.detach(|| {
+            self.inner.attach_subscriber(
+                alias,
+                Arc::new(subscribers::python::PySubscriberWrapper(subscriber)),
+            );
+        });
+    }
+
+    pub fn detach_subscriber(&self, py: Python, alias: &str) -> PyResult<()> {
+        py.detach(|| self.inner.detach_subscriber(alias))?;
+        Ok(())
+    }
+
+    pub fn notify_query_start(
+        &self,
+        py: Python,
+        query_id: String,
+        metadata: PyQueryMetadata,
+    ) -> PyResult<()> {
+        py.detach(|| {
+            self.inner
+                .notify_query_start(query_id.into(), metadata.into())
+        })?;
+        Ok(())
+    }
+
+    pub fn notify_query_end(&self, py: Python, query_id: String, query_result: PyQueryResult) {
+        py.detach(|| {
+            self.inner
+                .notify_query_end(query_id.into(), query_result.into());
+        });
+    }
+
+    pub fn notify_result_out(
+        &self,
+        py: Python,
+        query_id: String,
+        result: PyMicroPartition,
+    ) -> PyResult<()> {
+        py.detach(|| self.inner.notify_result_out(query_id.into(), result.into()))?;
+        Ok(())
+    }
+
+    pub fn notify_optimization_start(&self, py: Python, query_id: String) -> PyResult<()> {
+        py.detach(|| self.inner.notify_optimization_start(query_id.into()))?;
+        Ok(())
+    }
+
+    pub fn notify_optimization_end(
+        &self,
+        py: Python,
+        query_id: String,
+        optimized_plan: String,
+    ) -> PyResult<()> {
+        py.detach(|| {
+            self.inner
+                .notify_optimization_end(query_id.into(), optimized_plan.into())
+        })?;
+        Ok(())
+    }
+
+    pub fn notify_exec_start(
+        &self,
+        py: Python,
+        query_id: String,
+        physical_plan: String,
+    ) -> PyResult<()> {
+        py.detach(|| {
+            self.inner
+                .notify_exec_start(query_id.into(), physical_plan.into())
+        })?;
+        Ok(())
+    }
+
+    pub fn notify_exec_end(&self, py: Python, query_id: String) -> PyResult<()> {
+        py.detach(|| self.inner.notify_exec_end(query_id.into()))?;
+        Ok(())
+    }
+
+    pub fn notify_exec_operator_start(
+        &self,
+        py: Python,
+        query_id: String,
+        node_id: usize,
+    ) -> PyResult<()> {
+        py.detach(|| {
+            self.inner
+                .notify_exec_operator_start(query_id.into(), node_id)
+        })?;
+        Ok(())
+    }
+
+    pub fn notify_exec_operator_end(
+        &self,
+        py: Python,
+        query_id: String,
+        node_id: usize,
+    ) -> PyResult<()> {
+        py.detach(|| {
+            self.inner
+                .notify_exec_operator_end(query_id.into(), node_id)
+        })?;
+        Ok(())
+    }
+
+    pub fn notify_exec_emit_stats(
+        &self,
+        py: Python,
+        query_id: String,
+        node_id: usize,
+        stats: HashMap<String, i64>,
+    ) -> PyResult<()> {
+        let stats_map = common_metrics::Stats(
+            stats
+                .into_iter()
+                .map(|(k, v)| (k.into(), common_metrics::Stat::Count(v as u64)))
+                .collect(),
+        );
+        let all_stats = vec![(node_id, stats_map)];
+        py.detach(|| {
+            self.inner
+                .notify_exec_emit_stats(query_id.into(), all_stats)
+        })?;
+        Ok(())
+    }
+}
+
+impl From<DaftContext> for PyDaftContext {
+    fn from(ctx: DaftContext) -> Self {
+        Self { inner: ctx }
+    }
+}
+
+impl From<PyDaftContext> for DaftContext {
+    fn from(ctx: PyDaftContext) -> Self {
+        ctx.inner
+    }
+}
+
+impl<'a> From<&'a PyDaftContext> for &'a DaftContext {
+    fn from(ctx: &'a PyDaftContext) -> Self {
+        &ctx.inner
+    }
+}
+
+#[pyfunction]
+pub fn get_context() -> PyDaftContext {
+    PyDaftContext {
+        inner: super::get_context(),
+    }
+}

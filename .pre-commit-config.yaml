@@ -1,0 +1,138 @@
+# See https://pre-commit.com for more information
+# See https://pre-commit.com/hooks.html for more hooks
+repos:
+- repo: https://github.com/pre-commit/mirrors-mypy
+  rev: v1.19.1
+  hooks:
+  - id: mypy
+    args: ['--strict', '--ignore-missing-imports']
+    additional_dependencies: [types-requests, types-PyYAML, types-tabulate, pandas-stubs, types-Deprecated]
+    files: daft
+    exclude: |
+      (?x)^(
+          daft/pickle/.*\.py|
+          benchmarking/.*
+      )$
+
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v6.0.0
+  hooks:
+  - id: detect-private-key
+  - id: trailing-whitespace
+    exclude: (?x)^(tests/assets/mvp.csv|.*\.warc|tests/dataframe/test_show.py)$
+  - id: end-of-file-fixer
+    exclude: |
+      (?x)^(
+          .*\.warc|
+          CLAUDE\.md|
+          docs/contributing/overview\.md
+      )$
+  - id: check-yaml
+    exclude: kubernetes-ops|k8s/charts/.*/templates/.*\.ya?ml$
+    args:
+    - --unsafe
+  - id: pretty-format-json
+    exclude: |
+      (?x)^(
+          tutorials/.*\.ipynb|
+          docs/.*\.ipynb|
+          .*\.jsonl
+      )$
+    args:
+    - --autofix
+    - --no-sort-keys
+    - '--indent=  '
+  - id: check-added-large-files
+    exclude: uv.lock
+  - id: check-merge-conflict
+  - id: check-docstring-first
+  - id: check-toml
+
+- repo: https://github.com/macisamuele/language-formatters-pre-commit-hooks
+  rev: v2.15.0
+  hooks:
+  - id: pretty-format-toml
+    args: [--autofix, --no-sort]
+    exclude: (Cargo.lock|uv.lock)
+  - id: pretty-format-yaml
+    args: [--autofix, --preserve-quotes]
+    exclude: k8s/charts/.*/templates/.*\.ya?ml$
+
+- repo: https://github.com/codespell-project/codespell
+  rev: v2.4.1
+  hooks:
+  - id: codespell
+    additional_dependencies:
+    - tomli
+    exclude: static-dashboard-assets
+
+- repo: https://github.com/astral-sh/ruff-pre-commit
+  # Ruff version.
+  rev: v0.14.10
+  hooks:
+    # Run the linter.
+  - id: ruff-check
+    args: [--fix, --exit-non-zero-on-fix, --show-fixes]
+    exclude: benchmarking
+    # Run the formatter.
+  - id: ruff-format
+    name: Python code Formatting
+    exclude: benchmarking
+
+- repo: https://github.com/astral-sh/uv-pre-commit
+  # uv version.
+  rev: 0.11.2
+  hooks:
+  - id: uv-lock
+
+- repo: https://github.com/abravalheri/validate-pyproject
+  rev: v0.24.1
+  hooks:
+  - id: validate-pyproject
+
+- repo: local
+  hooks:
+  - id: check-invalid-deps
+    name: Check Invalid Dependencies
+    description: Check for invalid Rust dependencies
+    entry: ./tools/check_invalid_deps.sh
+    language: system
+    types: [rust]
+    pass_filenames: false
+
+  - id: fmt
+    name: Rust Code Formatting
+    description: Format files with cargo fmt.
+    entry: cargo fmt --manifest-path Cargo.toml
+    language: system
+    types: [rust]
+    args: [--]
+
+  - id: cargo-check-default
+    name: cargo check (default)
+    description: Check the package for errors with default features.
+    entry: cargo check
+    language: system
+    types: [rust]
+    pass_filenames: false
+    stages: [manual]
+    args: [--workspace, --all-targets, -v]
+
+  - id: cargo-check-all-features
+    name: cargo check (all features)
+    description: Check the package for errors.
+    entry: cargo check
+    language: system
+    types: [rust]
+    pass_filenames: false
+    stages: [manual]
+    args: [--workspace, --all-features, --all-targets]
+
+  - id: clippy
+    name: Rust code quality check
+    description: Lint rust sources
+    entry: cargo clippy
+    language: system
+    args: [--workspace, --all-features, --all-targets, --, -D, warnings]
+    types: [rust]
+    pass_filenames: false

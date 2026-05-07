@@ -1,0 +1,29 @@
+[dependencies]
+common-error = {path = "../common/error", default-features = false}
+daft-core = {path = "../daft-core", default-features = false}
+daft-dsl = {path = "../daft-dsl", default-features = false}
+daft-hash = {workspace = true}
+arrow-array = {workspace = true}
+num-traits = {workspace = true}
+pyo3 = {workspace = true, optional = true}
+typetag = {workspace = true}
+serde = {workspace = true}
+snafu = {workspace = true}
+uuid = {workspace = true}
+rand = {workspace = true}
+
+[features]
+python = [
+  "common-error/python",
+  "daft-core/python",
+  "daft-dsl/python",
+  "dep:pyo3"
+]
+
+[lints]
+workspace = true
+
+[package]
+name = "daft-functions"
+edition.workspace = true
+version.workspace = true

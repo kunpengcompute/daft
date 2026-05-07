@@ -1,0 +1,238 @@
+use std::{borrow::Borrow, collections::HashSet, sync::Arc};
+
+use arrow::{
+    datatypes::{DataType, Field, Fields, Schema, TimeUnit},
+    error::ArrowError,
+};
+use indexmap::IndexMap;
+use simd_json::StaticNode;
+
+use crate::deserializer::{Object, Value as BorrowedValue};
+
+const ITEM_NAME: &str = "item";
+
+/// Infer Arrow schema from JSON Value record.
+pub fn infer_records_schema(record: &BorrowedValue) -> Result<Schema, ArrowError> {
+    let fields = match record {
+        BorrowedValue::Array(array) => {
+            let dtype = infer_array(array.as_slice())?;
+
+            if let DataType::LargeList(f) = dtype {
+                if let DataType::Struct(fields) = f.data_type() {
+                    Ok(fields.iter().cloned().collect::<Vec<_>>())
+                } else {
+                    Err(ArrowError::InvalidArgumentError(
+                        "Deserialized JSON value is not a Struct record".to_string(),
+                    ))
+                }
+            } else {
+                Err(ArrowError::InvalidArgumentError(
+                    "Deserialized JSON value is not an Array record".to_string(),
+                ))
+            }
+        }
+        BorrowedValue::Object(record) => record
+            .iter()
+            .map(|(name, value)| {
+                let data_type = infer(value)?;
+                Ok(Arc::new(Field::new(name.as_ref(), data_type, true)))
+            })
+            .collect::<Result<Vec<_>, ArrowError>>(),
+        _ => Err(ArrowError::InvalidArgumentError(
+            "Deserialized JSON value is not an Object record".to_string(),
+        )),
+    }?;
+
+    Ok(Schema::new(fields))
+}
+
+/// Infers [`DataType`] from [`Value`].
+fn infer(json: &BorrowedValue) -> Result<DataType, ArrowError> {
+    Ok(match json {
+        BorrowedValue::Static(StaticNode::Bool(_)) => DataType::Boolean,
+        BorrowedValue::Static(StaticNode::Null) => DataType::Null,
+        BorrowedValue::Static(StaticNode::I64(_)) => DataType::Int64,
+        BorrowedValue::Static(StaticNode::U64(_)) => DataType::UInt64,
+        BorrowedValue::Static(StaticNode::F64(_)) => DataType::Float64,
+        BorrowedValue::String(s) => infer_string(s),
+        BorrowedValue::Array(array) => infer_array(array.as_slice())?,
+        BorrowedValue::Object(inner) => infer_object(inner)?,
+    })
+}
+
+fn infer_string(string: &str) -> DataType {
+    daft_decoding::inference::infer_string(string)
+}
+
+fn infer_object(inner: &Object) -> Result<DataType, ArrowError> {
+    let fields = inner
+        .iter()
+        .map(|(key, value)| infer(value).map(|dt| (key, dt)))
+        .map(|maybe_dt| {
+            let (key, dt) = maybe_dt?;
+            Ok(Field::new(key.as_ref(), dt, true))
+        })
+        .collect::<Result<Vec<_>, ArrowError>>()?;
+    Ok(DataType::Struct(Fields::from(fields)))
+}
+
+fn infer_array(values: &[BorrowedValue]) -> Result<DataType, ArrowError> {
+    let types = values
+        .iter()
+        .map(infer)
+        // Deduplicate dtypes.
+        .collect::<Result<HashSet<_>, ArrowError>>()?;
+
+    let dt = if !types.is_empty() {
+        coerce_data_type(types)
+    } else {
+        DataType::Null
+    };
+
+    // Don't add a record that contains only nulls.
+    Ok(if dt == DataType::Null {
+        dt
+    } else {
+        DataType::LargeList(Arc::new(Field::new(ITEM_NAME, dt, true)))
+    })
+}
+
+/// Convert each column's set of inferred dtypes to a field with a consolidated dtype, following the coercion rules
+/// defined in coerce_data_type.
+pub fn column_types_map_to_fields(column_types: IndexMap<String, HashSet<DataType>>) -> Vec<Field> {
+    column_types
+        .into_iter()
+        .map(|(name, dtype_set)| {
+            // Get consolidated dtype for column.
+            let dtype = coerce_data_type(dtype_set);
+            Field::new(name, dtype, true)
+        })
+        .collect::<Vec<_>>()
+}
+
+/// Coerce an heterogeneous set of [`DataType`] into a single one. Rules:
+/// * The empty set is coerced to `Null`
+/// * `Int64` and `Float64` are `Float64`
+/// * Lists and scalars are coerced to a list of a compatible scalar
+/// * Structs contain the union of all fields
+/// * All other types are coerced to `Utf8`
+pub fn coerce_data_type(mut datatypes: HashSet<DataType>) -> DataType {
+    // Drop null dtype from the dtype set.
+    datatypes.remove(&DataType::Null);
+
+    if datatypes.is_empty() {
+        return DataType::Null;
+    }
+
+    // All equal.
+    if datatypes.len() == 1 {
+        return datatypes.into_iter().next().unwrap();
+    }
+
+    let are_all_structs = datatypes
+        .iter()
+        .all(|x| matches!((*x).borrow(), DataType::Struct(_)));
+
+    if are_all_structs {
+        // All structs => union of all field dtypes (these may have equal names).
+        let fields = datatypes.into_iter().fold(vec![], |mut acc, dt| {
+            if let DataType::Struct(new_fields) = dt {
+                acc.extend(new_fields.iter().cloned());
+            }
+            acc
+        });
+        // Group fields by unique names.
+        let fields = fields.into_iter().fold(
+            IndexMap::<String, HashSet<DataType>>::new(),
+            |mut acc, field| {
+                match acc.entry(field.name().clone()) {
+                    indexmap::map::Entry::Occupied(mut v) => {
+                        v.get_mut().insert(field.data_type().clone());
+                    }
+                    indexmap::map::Entry::Vacant(v) => {
+                        let mut a = HashSet::new();
+                        a.insert(field.data_type().clone());
+                        v.insert(a);
+                    }
+                }
+                acc
+            },
+        );
+        // Coerce dtype set for each field.
+        let fields: Vec<Field> = fields
+            .into_iter()
+            .map(|(name, dts)| Field::new(name, coerce_data_type(dts), true))
+            .collect();
+        return DataType::Struct(Fields::from(fields));
+    }
+    datatypes
+        .into_iter()
+        .reduce(|lhs, rhs| {
+            match (lhs, rhs) {
+                (lhs, rhs) if lhs == rhs => lhs,
+                (DataType::LargeUtf8, _) | (_, DataType::LargeUtf8) => DataType::LargeUtf8,
+                (DataType::LargeList(lhs), DataType::LargeList(rhs)) => {
+                    let inner =
+                        coerce_data_type([lhs.data_type().clone(), rhs.data_type().clone()].into());
+                    DataType::LargeList(Arc::new(Field::new(ITEM_NAME, inner, true)))
+                }
+                (scalar, DataType::LargeList(list)) | (DataType::LargeList(list), scalar) => {
+                    let inner = coerce_data_type([scalar, list.data_type().clone()].into());
+                    DataType::LargeList(Arc::new(Field::new(ITEM_NAME, inner, true)))
+                }
+                (DataType::Float64, DataType::Int64) | (DataType::Int64, DataType::Float64) => {
+                    DataType::Float64
+                }
+                (DataType::Int64, DataType::Boolean) | (DataType::Boolean, DataType::Int64) => {
+                    DataType::Int64
+                }
+                (DataType::Time64(left_tu), DataType::Time64(right_tu)) => {
+                    // Set unified time unit to the lowest granularity time unit.
+                    let unified_tu = if left_tu == right_tu
+                        || time_unit_to_ordinal(&left_tu) < time_unit_to_ordinal(&right_tu)
+                    {
+                        left_tu
+                    } else {
+                        right_tu
+                    };
+                    DataType::Time64(unified_tu)
+                }
+                (
+                    DataType::Timestamp(left_tu, left_tz),
+                    DataType::Timestamp(right_tu, right_tz),
+                ) => {
+                    // Set unified time unit to the lowest granularity time unit.
+                    let unified_tu = if left_tu == right_tu
+                        || time_unit_to_ordinal(&left_tu) < time_unit_to_ordinal(&right_tu)
+                    {
+                        left_tu
+                    } else {
+                        right_tu
+                    };
+                    // Set unified time zone to UTC.
+                    let unified_tz = match (&left_tz, &right_tz) {
+                        (None, None) => None,
+                        (None, _) | (_, None) => return DataType::LargeUtf8,
+                        (Some(l), Some(r)) if l == r => left_tz,
+                        (Some(_), Some(_)) => Some("Z".into()),
+                    };
+                    DataType::Timestamp(unified_tu, unified_tz)
+                }
+                (DataType::Timestamp(_, None), DataType::Date32)
+                | (DataType::Date32, DataType::Timestamp(_, None)) => {
+                    DataType::Timestamp(TimeUnit::Second, None)
+                }
+                (_, _) => DataType::LargeUtf8,
+            }
+        })
+        .unwrap()
+}
+
+fn time_unit_to_ordinal(tu: &TimeUnit) -> usize {
+    match tu {
+        TimeUnit::Second => 0,
+        TimeUnit::Millisecond => 1,
+        TimeUnit::Microsecond => 2,
+        TimeUnit::Nanosecond => 3,
+    }
+}

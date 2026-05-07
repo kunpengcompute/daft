@@ -1,0 +1,186 @@
+@import "tailwindcss";
+
+/* ############################################################## */
+/* ########################################  B A S E   L A Y E R  */
+/* ############################################################## */
+
+@layer base {
+  :root {
+    /* Daft Dark Theme - Primary Colors */
+    --background: 0 0% 7%; /* #121212 */
+    --foreground: 0 0% 100%; /* #ffffff */
+    --card: 0 0% 12%; /* #1f2128 */
+    --card-foreground: 0 0% 100%;
+    --popover: 0 0% 12%;
+    --popover-foreground: 0 0% 100%;
+    --primary: 300 100% 50%; /* #ff00ff - Daft magenta */
+    --primary-foreground: 0 0% 100%;
+    --secondary: 0 0% 8%; /* #14151a */
+    --secondary-foreground: 0 0% 100%;
+    --muted: 0 0% 8%;
+    --muted-foreground: 0 0% 65%; /* #a0a0a0 */
+    --accent: 300 100% 50%; /* Daft magenta accent */
+    --accent-foreground: 0 0% 100%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 0 0% 25%; /* #404040 */
+    --input: 0 0% 25%;
+    --ring: 300 100% 50%; /* Daft magenta ring */
+    --chart-1: 300 100% 50%; /* Daft magenta */
+    --chart-2: 200 100% 50%; /* Blue accent */
+    --chart-3: 120 100% 50%; /* Green accent */
+    --chart-4: 30 100% 50%; /* Orange accent */
+    --chart-5: 270 100% 50%; /* Purple accent */
+    --radius: 0.5rem;
+    --sidebar-background: 0 0% 98%;
+    --sidebar-foreground: 240 5.3% 26.1%;
+    --sidebar-primary: 240 5.9% 10%;
+    --sidebar-primary-foreground: 0 0% 98%;
+    --sidebar-accent: 240 4.8% 95.9%;
+    --sidebar-accent-foreground: 240 5.9% 10%;
+    --sidebar-border: 220 13% 91%;
+    --sidebar-ring: 217.2 91.2% 59.8%;
+
+    /* Daft-specific colors */
+    --daft-accent: #ff00ff;
+    --daft-bg-primary: 0 0% 7%; /* #121212 */
+    --daft-bg-secondary: 0 0% 12%; /* #1f2128 */
+    --daft-bg-accent: 0 0% 8%; /* #14151a */
+    --daft-text-primary: 0 0% 100%; /* #ffffff */
+    --daft-text-secondary: 0 0% 82%; /* #d0d0d0 */
+    --daft-text-muted: 0 0% 65%; /* #a0a0a0 */
+    --daft-border-primary: 0 0% 25%; /* #404040 */
+    --daft-border-secondary: 0 0% 32%; /* #525252 */
+  }
+
+  .dark {
+    /* Override only the properties that differ from root */
+    --destructive: 0 62.8% 30.6%;
+    --sidebar-background: 240 5.9% 10%;
+    --sidebar-foreground: 240 4.8% 95.9%;
+    --sidebar-primary: 224.3 76.3% 48%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 240 3.7% 15.9%;
+    --sidebar-accent-foreground: 240 4.8% 95.9%;
+    --sidebar-border: 240 3.7% 15.9%;
+  }
+}
+
+@layer base {
+  * {
+    border-color: hsl(var(--border));
+  }
+  body {
+    background-color: hsl(var(--background));
+    color: hsl(var(--foreground));
+  }
+}
+
+/* ############################################################## */
+/* ##########################################  I C O N S . T X S  */
+/* ############################################################## */
+
+.fish-container {
+  height: 1.3em;
+  position: relative;
+  top: -2px;
+  animation: up-down 1s alternate ease-in-out infinite;
+}
+@keyframes up-down {
+  from {
+    transform: translateY(-2px);
+  }
+  to {
+    transform: translateY(2px);
+  }
+}
+.fish-swim {
+  animation: rotate 2s linear infinite;
+  transform-origin: center;
+}
+@keyframes rotate {
+  0% {
+    transform: rotate(0deg);
+  }
+  25% {
+    transform: rotate(20deg);
+  }
+  50% {
+    transform: rotate(0deg);
+  }
+  75% {
+    transform: rotate(-20deg);
+  }
+  100% {
+    transform: rotate(0deg);
+  }
+}
+
+/* ############################################################## */
+/* ############################################# L O G O . T S X  */
+/* ############################################################## */
+
+@keyframes terminal-text {
+    0% {
+        --text: "{";
+    }
+    16.6% {
+        --text: ">#";
+    }
+    33.2% {
+        --text: "d[:";
+    }
+    49.8% {
+        --text: "da=/";
+    }
+    66.4% {
+        --text: 'daf"';
+    }
+    83% {
+        --text: "daft";
+    }
+    100% {
+        --text: "daft";
+    }
+}
+.terminal-text {
+    animation: terminal-text 0.3s steps(1) forwards;
+}
+.terminal-text::before {
+    content: var(--text, "{");
+}
+
+/* ############################################################## */
+/* ######################  R E S U L T - P R E V I E W . T S X    */
+/* ############################################################## */
+
+.result-preview-table table {
+  border-collapse: collapse;
+  width: 100%;
+  background: transparent;
+  font-family: ui-monospace, monospace;
+  font-size: 0.85rem;
+}
+.result-preview-table th {
+  color: #a1a1aa;
+  text-align: left;
+  padding: 8px 12px;
+  border-bottom: 2px solid #3f3f46;
+  white-space: nowrap;
+}
+.result-preview-table td {
+  color: #d4d4d8;
+  padding: 6px 12px;
+  border-bottom: 1px solid #3f3f46;
+  max-width: 400px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.result-preview-table tr:hover td {
+  background: rgba(39, 39, 42, 0.5);
+}
+.result-preview-table img {
+  max-height: 100px;
+  max-width: 200px;
+}

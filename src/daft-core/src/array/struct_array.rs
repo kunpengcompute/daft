@@ -1,0 +1,249 @@
+use std::sync::Arc;
+
+use arrow::array::ArrayRef;
+use common_error::{DaftError, DaftResult};
+
+use crate::{
+    array::ops::from_arrow::FromArrow,
+    datatypes::{DaftArrayType, DataType, Field},
+    series::Series,
+};
+
+#[derive(Clone, Debug)]
+pub struct StructArray {
+    pub field: Arc<Field>,
+
+    /// Column representations
+    pub children: Vec<Series>,
+    nulls: Option<arrow::buffer::NullBuffer>,
+    len: usize,
+}
+
+impl DaftArrayType for StructArray {
+    fn data_type(&self) -> &DataType {
+        &self.field.as_ref().dtype
+    }
+}
+
+impl StructArray {
+    pub fn new<F: Into<Arc<Field>>>(
+        field: F,
+        children: Vec<Series>,
+        nulls: Option<arrow::buffer::NullBuffer>,
+    ) -> Self {
+        let field: Arc<Field> = field.into();
+        match &field.as_ref().dtype {
+            DataType::Struct(fields) => {
+                assert!(
+                    fields.len() == children.len(),
+                    "StructArray::new received {} children arrays but expected {} for specified dtype: {}",
+                    children.len(),
+                    fields.len(),
+                    &field.as_ref().dtype
+                );
+                for (dtype_field, series) in fields.iter().zip(children.iter()) {
+                    assert!(
+                        !(&dtype_field.dtype != series.data_type()),
+                        "StructArray::new received an array with dtype: {} but expected child field: {}",
+                        series.data_type(),
+                        dtype_field
+                    );
+                    assert!(
+                        *dtype_field.name == *series.name(),
+                        "StructArray::new received a series with name: {} but expected name: {}",
+                        series.name(),
+                        &dtype_field.name
+                    );
+                }
+
+                let len = if !children.is_empty() {
+                    children[0].len()
+                } else {
+                    nulls.as_ref().map_or(0, |n| n.len())
+                };
+
+                for s in &children {
+                    assert!(
+                        s.len() == len,
+                        "StructArray::new expects all children to have the same length, but received: {} vs {}",
+                        s.len(),
+                        len
+                    );
+                }
+                if let Some(some_nulls) = &nulls
+                    && some_nulls.len() != len
+                {
+                    panic!(
+                        "StructArray::new expects validity to have length {} but received: {}",
+                        len,
+                        some_nulls.len()
+                    )
+                }
+
+                Self {
+                    field,
+                    children,
+                    nulls,
+                    len,
+                }
+            }
+            _ => panic!(
+                "StructArray::new expected Struct datatype, but received field: {}",
+                field
+            ),
+        }
+    }
+
+    pub fn new_empty<F: Into<Arc<Field>>>(
+        field: F,
+        len: usize,
+        nulls: Option<arrow::buffer::NullBuffer>,
+    ) -> Self {
+        let field: Arc<Field> = field.into();
+        assert!(
+            matches!(&field.dtype, DataType::Struct(fields) if fields.is_empty()),
+            "StructArray::new_empty expected empty Struct datatype, but received field: {}",
+            field
+        );
+        if let Some(ref n) = nulls {
+            assert!(
+                n.len() == len,
+                "StructArray::new_empty expects validity to have length {} but received: {}",
+                len,
+                n.len()
+            );
+        }
+        Self {
+            field,
+            children: vec![],
+            nulls,
+            len,
+        }
+    }
+
+    pub fn nulls(&self) -> Option<&arrow::buffer::NullBuffer> {
+        self.nulls.as_ref()
+    }
+
+    pub fn null_count(&self) -> usize {
+        match self.nulls() {
+            None => 0,
+            Some(nulls) => nulls.null_count(),
+        }
+    }
+
+    pub fn concat(arrays: &[&Self]) -> DaftResult<Self> {
+        if arrays.is_empty() {
+            return Err(DaftError::ValueError(
+                "Need at least 1 StructArray to concat".to_string(),
+            ));
+        }
+
+        if arrays.len() == 1 {
+            return Ok((*arrays.first().unwrap()).clone());
+        }
+
+        let first_array = arrays.first().unwrap();
+        let field = first_array.field.clone();
+
+        let arrow_arrs = arrays
+            .iter()
+            .map(|arr| arr.to_arrow())
+            .collect::<DaftResult<Vec<_>>>()?;
+        let arrow_refs = arrow_arrs
+            .iter()
+            .map(|arr| arr.as_ref())
+            .collect::<Vec<_>>();
+        let concatenated = arrow::compute::concat(&arrow_refs)?;
+        Self::from_arrow(field, concatenated)
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn field(&self) -> &Field {
+        &self.field
+    }
+
+    pub fn name(&self) -> &str {
+        &self.field.name
+    }
+
+    pub fn data_type(&self) -> &DataType {
+        &self.field.dtype
+    }
+
+    pub fn rename(&self, name: &str) -> Self {
+        Self {
+            field: Arc::new(Field::new(name, self.data_type().clone())),
+            children: self.children.clone(),
+            nulls: self.nulls.clone(),
+            len: self.len,
+        }
+    }
+
+    pub fn slice(&self, start: usize, end: usize) -> DaftResult<Self> {
+        if start > end {
+            return Err(DaftError::ValueError(format!(
+                "Trying to slice array with negative length, start: {start} vs end: {end}"
+            )));
+        }
+        Ok(Self::new(
+            self.field.clone(),
+            self.children
+                .iter()
+                .map(|s| s.slice(start, end))
+                .collect::<DaftResult<Vec<Series>>>()?,
+            self.nulls
+                .as_ref()
+                .map(|v| v.clone().slice(start, end - start)),
+        ))
+    }
+
+    pub fn to_arrow(&self) -> DaftResult<ArrayRef> {
+        let field = self.field().to_arrow()?;
+
+        let arrow::datatypes::DataType::Struct(fields) = field.data_type() else {
+            return Err(DaftError::TypeError(format!(
+                "Expected StructArray, got {:?}",
+                field.data_type()
+            )));
+        };
+        let children: Vec<ArrayRef> = self
+            .children
+            .iter()
+            .map(|s| s.to_arrow())
+            .collect::<DaftResult<_>>()?;
+
+        let nulls = self.nulls.clone();
+
+        if fields.is_empty() {
+            Ok(Arc::new(arrow::array::StructArray::new_empty_fields(self.len, nulls)) as _)
+        } else {
+            Ok(Arc::new(arrow::array::StructArray::new(
+                fields.clone(),
+                children,
+                nulls,
+            )) as _)
+        }
+    }
+
+    pub fn with_nulls(&self, nulls: Option<arrow::buffer::NullBuffer>) -> DaftResult<Self> {
+        if let Some(v) = &nulls
+            && v.len() != self.len()
+        {
+            return Err(DaftError::ValueError(format!(
+                "validity mask length does not match StructArray length, {} vs {}",
+                v.len(),
+                self.len()
+            )));
+        }
+
+        Ok(Self::new(self.field.clone(), self.children.clone(), nulls))
+    }
+}

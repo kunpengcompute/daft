@@ -1,0 +1,324 @@
+"use client";
+
+import { genApiUrl } from "@/components/server-provider";
+import {
+  Breadcrumb,
+  BreadcrumbItem,
+  BreadcrumbLink,
+  BreadcrumbList,
+  BreadcrumbSeparator,
+} from "@/components/ui/breadcrumb";
+import Link from "next/link";
+import { useSearchParams } from "next/navigation";
+import { Suspense, useEffect, useMemo, useState } from "react";
+import { toHumanReadableDate, main, getEngineName } from "@/lib/utils";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import LoadingPage from "@/components/loading";
+import { Status } from "./status";
+import { ExecutingState, OperatorInfo, QueryInfo } from "./types";
+import PhysicalPlanTree from "./physical-plan-tree";
+import PlanVisualizer from "./plan-visualizer";
+import ResultPreview from "./result-preview";
+
+/**
+ * Query detail page component
+ * Displays details for a specific query by ID using query parameters
+ */
+function QueryPageInner() {
+  const searchParams = useSearchParams();
+  const queryId = searchParams.get("id");
+  const debug = useMemo(() => searchParams.has("debug"), [searchParams]);
+  const [query, setQuery] = useState<QueryInfo | null>(null);
+
+  useEffect(() => {
+    const es = new EventSource(genApiUrl(`/client/query/${queryId}/subscribe`));
+    es.onopen = () => {
+      console.info("Connected to query SSE endpoint");
+    };
+    es.onerror = event => {
+      console.error("Error subscribing to query:", event);
+    };
+    // These overwrite
+    es.addEventListener("initial_state", event => {
+      const data: QueryInfo = JSON.parse(event.data);
+      if (debug) console.log("[debug] initial_state (query)", data);
+      setQuery(data);
+    });
+    // TODO: Consistent ordering of statistics
+    es.addEventListener("query_info", event => {
+      const data: QueryInfo = JSON.parse(event.data);
+      if (debug) console.log("[debug] query_info", data);
+      setQuery(data);
+    });
+    // Merges with existing info, preserving the current status
+    es.addEventListener("operator_info", event => {
+      const data: Record<number, OperatorInfo> = JSON.parse(event.data);
+      if (debug) console.log("[debug] operator_info", data);
+      setQuery(prev => {
+        if (!prev) return prev;
+        if (!("exec_info" in prev.state)) return prev;
+
+        const new_exec_info = { ...prev.state.exec_info, operators: data };
+        return {
+          ...prev,
+          state: { ...prev.state, exec_info: new_exec_info } as typeof prev.state,
+        };
+      });
+    });
+    return () => {
+      console.info("Closing query SSE endpoint");
+      es.close();
+    };
+  }, [queryId, debug, setQuery]);
+
+  if (!query) {
+    return <LoadingPage />;
+  }
+
+  const end_sec =
+    query.state.status === "Finished" || query.state.status === "Canceled" || query.state.status === "Failed"
+      ? query.state.end_sec
+      : null;
+
+  return (
+    <div className="h-full flex flex-col">
+      {/* Fixed Header Section */}
+      <div className="flex-shrink-0 space-y-4">
+        <Breadcrumb>
+          <BreadcrumbList>
+            <BreadcrumbItem>
+              <BreadcrumbLink
+                asChild
+                className="text-lg font-mono text-zinc-400 hover:text-white"
+              >
+                <Link href="/queries">All Queries</Link>
+              </BreadcrumbLink>
+            </BreadcrumbItem>
+            <BreadcrumbSeparator />
+            <BreadcrumbItem>
+              <BreadcrumbLink asChild className="text-lg font-mono font-bold">
+                <p>Query {queryId}</p>
+              </BreadcrumbLink>
+            </BreadcrumbItem>
+          </BreadcrumbList>
+        </Breadcrumb>
+
+        <div className="w-full flex border-b border-zinc-800">
+          <div className="w-1/4 border-r border-zinc-800 px-6 py-4">
+            <Status
+              status={query.state.status}
+              start_sec={query.start_sec}
+              end_sec={end_sec}
+            />
+          </div>
+          <div className="flex-1 px-6 py-4">
+            <div className="grid grid-cols-2 gap-6">
+              <div className="space-y-3">
+                <div>
+                  <h3
+                    className={`${main.className} text-sm font-semibold text-zinc-400 mb-1`}
+                  >
+                    Query ID
+                  </h3>
+                  <p className={`${main.className} text-lg font-mono text-zinc-100`}>
+                    {query.id}
+                  </p>
+                </div>
+                <div>
+                  <h3
+                    className={`${main.className} text-sm font-semibold text-zinc-400 mb-1`}
+                  >
+                    Start Time
+                  </h3>
+                  <p className={`${main.className} text-lg font-mono text-zinc-100`}>
+                    {toHumanReadableDate(query.start_sec)}
+                  </p>
+                </div>
+                <div>
+                  <h3 className={`${main.className} text-sm font-semibold text-zinc-400 mb-1`}>
+                    Entrypoint
+                  </h3>
+                  <p className={`${main.className} text-sm font-mono break-all text-zinc-100`} title={query.entrypoint || ""}>
+                    {query.entrypoint || "-"}
+                  </p>
+                </div>
+              </div>
+              <div className="space-y-3">
+                <div>
+                  <h3
+                    className={`${main.className} text-sm font-semibold text-zinc-400 mb-1`}
+                  >
+                    Engine
+                  </h3>
+                  <p className={`${main.className} text-lg font-mono text-zinc-100`}>
+                    {getEngineName(query.runner)}
+                  </p>
+                </div>
+                <div>
+                  <h3
+                    className={`${main.className} text-sm font-semibold text-zinc-400 mb-1`}
+                  >
+                    End Time
+                  </h3>
+                  <p className={`${main.className} text-lg font-mono text-zinc-100`}>
+                    {end_sec ? toHumanReadableDate(end_sec) : "..."}
+                  </p>
+                </div>
+                {query.ray_dashboard_url && (
+                  <div>
+                    <h3 className={`${main.className} text-sm font-semibold text-zinc-400 mb-1`}>
+                      Ray Dashboard
+                    </h3>
+                    <a
+                      href={query.ray_dashboard_url.startsWith("http") ? query.ray_dashboard_url : `http://${query.ray_dashboard_url}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className={`${main.className} text-sm font-mono text-blue-500 hover:underline`}
+                    >
+                      Open in Ray
+                    </a>
+                  </div>
+                )}
+              </div>
+              {(query.daft_version || query.python_version || query.ray_version) && (
+              <div className="space-y-3">
+                {query.daft_version && (
+                  <div>
+                    <h3 className={`${main.className} text-sm font-semibold text-zinc-400 mb-1`}>
+                      Daft Version
+                    </h3>
+                    <p className={`${main.className} text-lg font-mono text-zinc-100`}>
+                      {query.daft_version}
+                    </p>
+                  </div>
+                )}
+                {query.python_version && (
+                  <div>
+                    <h3 className={`${main.className} text-sm font-semibold text-zinc-400 mb-1`}>
+                      Python Version
+                    </h3>
+                    <p className={`${main.className} text-lg font-mono text-zinc-100`}>
+                      {query.python_version}
+                    </p>
+                  </div>
+                )}
+                {query.ray_version && (
+                  <div>
+                    <h3 className={`${main.className} text-sm font-semibold text-zinc-400 mb-1`}>
+                      Ray Version
+                    </h3>
+                    <p className={`${main.className} text-lg font-mono text-zinc-100`}>
+                      {query.ray_version}
+                    </p>
+                  </div>
+                )}
+              </div>
+              )}
+            </div>
+          </div>
+        </div>
+        <div className="w-full h-[20px] flex"></div>
+      </div>
+
+      {/* Scrollable Content Section */}
+      <div className="flex-1">
+        <Tabs
+          defaultValue="progress-table"
+          className="w-full h-full flex flex-col"
+        >
+          <TabsList className={`grid w-full flex-shrink-0 ${getEngineName(query.runner) === "Swordfish" ? "grid-cols-4" : "grid-cols-3"}`}>
+            <TabsTrigger
+              value="progress-table"
+              disabled={
+                query.state.status === "Pending" ||
+                query.state.status === "Optimizing" ||
+                query.state.status === "Setup"
+              }
+            >
+              Execution
+            </TabsTrigger>
+            <TabsTrigger
+              value="optimized-plan"
+              disabled={!("plan_info" in query.state)}
+            >
+              Optimized Plan
+            </TabsTrigger>
+            <TabsTrigger value="unoptimized-plan">Unoptimized Plan</TabsTrigger>
+            {/* Results preview only supported for Swordfish for now (#6559) */}
+            {getEngineName(query.runner) === "Swordfish" && (
+              <TabsTrigger
+                value="results"
+                disabled={query.state.status !== "Finished"}
+              >
+                Results
+              </TabsTrigger>
+            )}
+          </TabsList>
+
+          <TabsContent
+            value="progress-table"
+            className="mt-4 flex-1 overflow-auto"
+          >
+            <div className="bg-zinc-900 h-full">
+              {query.state.status === "Pending" ||
+                query.state.status === "Optimizing" ? (
+                <div className="p-8 text-center">
+                  <p className={`${main.className} text-zinc-400`}>
+                    Execution not yet started
+                  </p>
+                </div>
+              ) : (
+                <PhysicalPlanTree exec_state={query.state as ExecutingState} />
+              )}
+            </div>
+          </TabsContent>
+
+          <TabsContent
+            value="optimized-plan"
+            className="mt-4 flex-1 overflow-auto"
+          >
+            {query.state.status === "Pending" ? (
+              <div className="bg-zinc-900 p-4">
+                <p className={`${main.className} text-zinc-400`}>
+                  Plan not yet optimized
+                </p>
+              </div>
+            ) : (
+              <PlanVisualizer
+                planJson={
+                  "plan_info" in query.state
+                    ? query.state.plan_info.optimized_plan
+                    : ""
+                }
+              />
+            )}
+          </TabsContent>
+
+          <TabsContent
+            value="unoptimized-plan"
+            className="mt-4 flex-1 overflow-auto"
+          >
+            <PlanVisualizer planJson={query.unoptimized_plan} />
+          </TabsContent>
+
+          <TabsContent
+            value="results"
+            className="mt-4 flex-1 overflow-auto"
+          >
+            <div className="bg-zinc-900 h-full">
+              {queryId && <ResultPreview queryId={queryId} />}
+            </div>
+          </TabsContent>
+        </Tabs>
+      </div>
+    </div>
+  );
+}
+
+export default function QueryPage() {
+  return (
+    <Suspense fallback={<LoadingPage />}>
+      <QueryPageInner />
+    </Suspense>
+  );
+}

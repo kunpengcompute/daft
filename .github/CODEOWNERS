@@ -1,0 +1,32 @@
+# CODEOWNERS for Daft
+
+# Core Rust crates
+/src/daft-core/ @Eventual-Inc/daft-core-eng
+/src/daft-local-execution/ @Eventual-Inc/daft-core-eng
+/src/daft-distributed/ @Eventual-Inc/daft-core-eng
+/src/daft-io/ @Eventual-Inc/daft-core-eng
+/src/daft-parquet/ @Eventual-Inc/daft-core-eng
+/src/daft-logical-plan/ @Eventual-Inc/daft-core-eng
+/src/daft-local-plan/ @Eventual-Inc/daft-core-eng
+/src/daft-schema/ @Eventual-Inc/daft-core-eng
+/src/daft-shuffles/ @Eventual-Inc/daft-core-eng
+/src/daft-stats/ @Eventual-Inc/daft-core-eng
+/src/hyperloglog/ @Eventual-Inc/daft-core-eng
+
+# Critical Python modules
+/daft/runners/ @Eventual-Inc/daft-core-eng
+/daft/execution/ @Eventual-Inc/daft-core-eng
+/daft/pickle/ @Eventual-Inc/daft-core-eng
+/daft/recordbatch/ @Eventual-Inc/daft-core-eng
+/daft/udf/ @Eventual-Inc/daft-core-eng
+
+# CI/CD and build config
+/.github/ @Eventual-Inc/daft-core-eng
+/.cargo/ @Eventual-Inc/daft-core-eng
+/Cargo.lock @Eventual-Inc/daft-core-eng
+/Cargo.toml @Eventual-Inc/daft-core-eng
+/Makefile @Eventual-Inc/daft-core-eng
+/pyproject.toml @Eventual-Inc/daft-core-eng
+/uv.lock @Eventual-Inc/daft-core-eng
+/rust-toolchain.toml @Eventual-Inc/daft-core-eng
+/rustfmt.toml @Eventual-Inc/daft-core-eng

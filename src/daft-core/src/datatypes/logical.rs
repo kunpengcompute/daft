@@ -1,0 +1,201 @@
+use std::{marker::PhantomData, sync::Arc};
+
+use arrow::array::ArrayRef;
+use common_error::DaftResult;
+
+use super::{
+    DaftArrayType, DaftDataType, DataArray, DataType, DurationType, EmbeddingType,
+    FixedShapeImageType, FixedShapeSparseTensorType, FixedShapeTensorType, FixedSizeListArray,
+    ImageType, MapType, SparseTensorType, TensorType, TimeType, TimestampType,
+};
+use crate::{
+    array::{ListArray, StructArray},
+    datatypes::{DaftLogicalType, DateType, Field},
+};
+
+/// A LogicalArray is a wrapper on top of some underlying array, applying the semantic meaning of its
+/// field.datatype() to the underlying array.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalArrayImpl<L: DaftLogicalType, PhysicalArray: DaftArrayType> {
+    pub field: Arc<Field>,
+    pub physical: PhysicalArray,
+    marker_: PhantomData<L>,
+}
+
+impl<L: DaftLogicalType, W: DaftArrayType> DaftArrayType for LogicalArrayImpl<L, W> {
+    fn data_type(&self) -> &DataType {
+        &self.field.as_ref().dtype
+    }
+}
+
+impl<L: DaftLogicalType, P: DaftArrayType> LogicalArrayImpl<L, P> {
+    pub fn new<F: Into<Arc<Field>>>(field: F, physical: P) -> Self {
+        let field = field.into();
+        assert!(
+            field.dtype.is_logical(),
+            "Can only construct Logical Arrays on Logical Types, got {}",
+            field.dtype
+        );
+        assert_eq!(
+            physical.data_type().to_physical(),
+            field.dtype.to_physical(),
+            "Logical field {} expected {} for Physical Array, got {}",
+            &field,
+            field.dtype.to_physical(),
+            physical.data_type().to_physical()
+        );
+
+        Self {
+            physical,
+            field,
+            marker_: PhantomData,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        self.field.name.as_ref()
+    }
+
+    pub fn field(&self) -> &Field {
+        &self.field
+    }
+}
+
+macro_rules! impl_logical_type {
+    ($physical_array_type:ident) => {
+        // Clippy triggers false positives here for the MapArray implementation
+        // This is added to suppress the warning
+        #[allow(clippy::len_without_is_empty)]
+        pub fn len(&self) -> usize {
+            self.physical.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.len() == 0
+        }
+
+        pub fn concat(arrays: &[&Self]) -> DaftResult<Self> {
+            if arrays.is_empty() {
+                return Err(common_error::DaftError::ValueError(
+                    "Need at least 1 logical array to concat".to_string(),
+                ));
+            }
+            let physicals: Vec<_> = arrays.iter().map(|a| &a.physical).collect();
+            let concatd = $physical_array_type::concat(physicals.as_slice())?;
+            Ok(Self::new(arrays.first().unwrap().field.clone(), concatd))
+        }
+    };
+}
+
+/// Implementation for a LogicalArray that wraps a DataArray
+impl<L: DaftLogicalType> LogicalArrayImpl<L, DataArray<L::PhysicalType>> {
+    impl_logical_type!(DataArray);
+
+    pub fn to_arrow(&self) -> DaftResult<ArrayRef> {
+        let arrow_field = self.field().to_arrow()?;
+        let physical = self.physical.to_arrow();
+
+        Ok(arrow::compute::cast(
+            physical.as_ref(),
+            arrow_field.data_type(),
+        )?)
+    }
+}
+
+/// Implementation for a LogicalArray that wraps a FixedSizeListArray
+impl<L: DaftLogicalType> LogicalArrayImpl<L, FixedSizeListArray> {
+    impl_logical_type!(FixedSizeListArray);
+
+    pub fn to_arrow(&self) -> DaftResult<ArrayRef> {
+        let inner_dtype = self.physical.field().dtype.dtype()?;
+        let inner_field = Field::new("item", inner_dtype.clone()).to_arrow()?;
+        let size = self.physical.fixed_element_len() as i32;
+        let values = self.physical.flat_child.to_arrow()?;
+        let nulls = self.physical.nulls().cloned();
+
+        Ok(Arc::new(arrow::array::FixedSizeListArray::try_new(
+            Arc::new(inner_field),
+            size,
+            values,
+            nulls,
+        )?))
+    }
+}
+
+/// Implementation for a LogicalArray that wraps a StructArray
+impl<L: DaftLogicalType> LogicalArrayImpl<L, StructArray> {
+    impl_logical_type!(StructArray);
+
+    pub fn to_arrow(&self) -> DaftResult<ArrayRef> {
+        let struct_arrow_array = self.physical.to_arrow()?;
+        Ok(struct_arrow_array)
+    }
+}
+
+pub type MapArray = LogicalArray<MapType>;
+impl MapArray {
+    impl_logical_type!(ListArray);
+
+    pub fn to_arrow(&self) -> DaftResult<ArrayRef> {
+        let arrow_field = self.field().to_arrow()?;
+        let arrow_dtype = arrow_field.data_type();
+
+        let arrow::datatypes::DataType::Map(inner_struct_field, _) = arrow_dtype else {
+            unreachable!("Expected map type");
+        };
+        let arrow::datatypes::DataType::Struct(inner_struct_fields) =
+            inner_struct_field.as_ref().data_type()
+        else {
+            unreachable!("Expected struct type");
+        };
+
+        let inner_struct_array = self
+            .physical
+            .flat_child
+            .struct_()
+            .expect("Expected struct array");
+
+        let struct_arrays: Vec<ArrayRef> = inner_struct_array
+            .children
+            .iter()
+            .map(|s| s.to_arrow())
+            .collect::<DaftResult<_>>()?;
+
+        let struct_array = arrow::array::StructArray::try_new(
+            inner_struct_fields.clone(),
+            struct_arrays,
+            None, // Map entries cannot contain nulls; nulls live on the MapArray itself
+        )?;
+
+        let i32_offsets: Vec<i32> = self.physical.offsets().iter().map(|&o| o as i32).collect();
+        let offsets =
+            arrow::buffer::OffsetBuffer::new(arrow::buffer::ScalarBuffer::from(i32_offsets));
+        Ok(Arc::new(arrow::array::MapArray::try_new(
+            Arc::new(inner_struct_field.as_ref().clone().with_nullable(false)),
+            offsets,
+            struct_array,
+            self.physical.nulls().cloned(),
+            false,
+        )?))
+    }
+}
+
+pub type LogicalArray<L> =
+    LogicalArrayImpl<L, <<L as DaftLogicalType>::PhysicalType as DaftDataType>::ArrayType>;
+// pub type Decimal128Array = LogicalArray<Decimal128Type>;
+pub type DateArray = LogicalArray<DateType>;
+pub type TimeArray = LogicalArray<TimeType>;
+pub type DurationArray = LogicalArray<DurationType>;
+pub type ImageArray = LogicalArray<ImageType>;
+pub type TimestampArray = LogicalArray<TimestampType>;
+pub type TensorArray = LogicalArray<TensorType>;
+pub type EmbeddingArray = LogicalArray<EmbeddingType>;
+pub type FixedShapeTensorArray = LogicalArray<FixedShapeTensorType>;
+pub type SparseTensorArray = LogicalArray<SparseTensorType>;
+pub type FixedShapeSparseTensorArray = LogicalArray<FixedShapeSparseTensorType>;
+pub type FixedShapeImageArray = LogicalArray<FixedShapeImageType>;
+
+pub trait DaftImageryType: DaftLogicalType {}
+
+impl DaftImageryType for ImageType {}
+impl DaftImageryType for FixedShapeImageType {}

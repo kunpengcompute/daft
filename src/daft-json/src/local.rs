@@ -1,0 +1,602 @@
+use std::{borrow::Cow, collections::HashSet, num::NonZeroUsize, sync::Arc};
+
+use arrow::array::builder::ArrayBuilder;
+use common_error::{DaftError, DaftResult};
+use daft_core::prelude::*;
+use daft_dsl::{Expr, ExprRef, expr::bound_expr::BoundExpr};
+use daft_recordbatch::RecordBatch;
+use indexmap::IndexMap;
+use num_traits::Pow;
+use rayon::{ThreadPoolBuilder, prelude::*};
+use serde_json::value::RawValue;
+use simd_json::StaticNode;
+use snafu::ResultExt;
+
+use crate::{
+    ArrowSnafu, JsonConvertOptions, JsonParseOptions, JsonReadOptions, RayonThreadPoolSnafu,
+    StdIOSnafu,
+    decoding::{allocate_array, deserialize_into},
+    deserializer::Value,
+    inference::{column_types_map_to_fields, infer_records_schema},
+    read::{tables_concat, truncate_tables_to_limit},
+};
+
+const JSON_NULL_VALUE: Value<'static> = Value::Static(StaticNode::Null);
+
+const NEWLINE: u8 = b'\n';
+const CLOSING_BRACKET: u8 = b'}';
+
+/// Backward-compatible wrapper that concatenates all chunks into a single RecordBatch.
+///
+/// Only used by legacy test paths (via `read_json_single_into_table`).
+/// The production path uses [`read_json_local_into_tables_with_range`] directly via `stream_json`.
+pub fn read_json_local(
+    uri: &str,
+    convert_options: Option<JsonConvertOptions>,
+    parse_options: Option<JsonParseOptions>,
+    read_options: Option<JsonReadOptions>,
+    max_chunks_in_flight: Option<usize>,
+) -> DaftResult<RecordBatch> {
+    let schema_hint = convert_options
+        .as_ref()
+        .and_then(|c| c.schema.as_ref())
+        .map_or_else(|| Schema::empty().into(), |s| s.clone());
+    let tables = read_json_local_into_tables_with_range(
+        uri,
+        convert_options,
+        parse_options,
+        read_options,
+        max_chunks_in_flight,
+        None,
+    )?;
+    if tables.is_empty() {
+        return Ok(RecordBatch::empty(Some(schema_hint)));
+    }
+    tables_concat(tables)
+}
+
+pub fn read_json_local_into_tables_with_range(
+    uri: &str,
+    convert_options: Option<JsonConvertOptions>,
+    parse_options: Option<JsonParseOptions>,
+    read_options: Option<JsonReadOptions>,
+    max_chunks_in_flight: Option<usize>,
+    range: Option<daft_io::GetRange>,
+) -> DaftResult<Vec<RecordBatch>> {
+    let uri = uri.trim_start_matches("file://");
+    let file = std::fs::File::open(uri)?;
+    // SAFETY: mmapping is inherently unsafe.
+    // We are trusting that the file is not modified or accessed by other systems while we are reading it.
+    let mmap = unsafe { memmap2::Mmap::map(&file) }.context(StdIOSnafu)?;
+    let full_bytes = &mmap[..];
+    let has_range = range.is_some();
+    let bytes = if let Some(range) = range {
+        let slice_range = range
+            .as_range(full_bytes.len())
+            .map_err(|e| DaftError::ValueError(e.to_string()))?;
+        &full_bytes[slice_range]
+    } else {
+        full_bytes
+    };
+
+    if parse_options.as_ref().is_some_and(|p| p.skip_empty_files) && bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if bytes.is_empty() {
+        return Err(super::Error::JsonDeserializationError {
+            string: "Invalid JSON format - file is empty".to_string(),
+        }
+        .into());
+    }
+
+    // Detect JSON array format (e.g. `[{...}, {...}]`) by checking if the first byte is `[`.
+    //
+    // We only do this check when reading the full file (!has_range), because when reading a
+    // byte-range sub-slice (from scan_task_split_and_merge), `bytes` is a fragment of the
+    // original file — the first byte is whatever happens to be at the range start, NOT the
+    // first byte of the file. Checking `bytes[0]` on a fragment would be meaningless.
+    //
+    // This guard is safe because split_by_jsonl_ranges only creates byte-range sub-tasks for
+    // JSONL files (.jsonl / .ndjson); JSON array files (.json) are excluded by `supports_split`,
+    // so they will always arrive here with has_range == false.
+    if !has_range && bytes[0] == b'[' {
+        let schema: Schema = infer_schema(bytes, None, None)?.try_into()?;
+        let predicate = convert_options
+            .as_ref()
+            .and_then(|options| options.predicate.clone());
+        return Ok(vec![read_json_array_impl(bytes, schema, predicate)?]);
+    }
+
+    let reader = JsonReader::try_new(
+        bytes,
+        convert_options,
+        parse_options,
+        read_options,
+        max_chunks_in_flight,
+    )?;
+    reader.finish_into_tables()
+}
+
+pub fn read_json_array_impl(
+    bytes: &[u8],
+    schema: Schema,
+    predicate: Option<ExprRef>,
+) -> DaftResult<RecordBatch> {
+    let mut scratch = vec![];
+    let scratch = &mut scratch;
+
+    let daft_fields = schema.into_iter().cloned().map(Arc::new);
+
+    let arrow_schema = schema.to_arrow()?;
+    let arrow_fields: Vec<_> = arrow_schema.fields().iter().collect();
+
+    let iter =
+        serde_json::Deserializer::from_slice(bytes).into_iter::<&serde_json::value::RawValue>();
+
+    let mut columns: IndexMap<Cow<str>, Box<dyn ArrayBuilder>> = arrow_fields
+        .iter()
+        .map(|f| (Cow::Owned(f.name().clone()), allocate_array(f, bytes.len())))
+        .collect();
+
+    let mut num_rows = 0;
+    for record in iter {
+        let value = record.map_err(|e| super::Error::JsonDeserializationError {
+            string: e.to_string(),
+        })?;
+        let v = parse_raw_value(value, scratch)?;
+
+        match v {
+            Value::Array(arr) => {
+                for value in arr {
+                    if let Value::Object(record) = value {
+                        for (i, (s, inner)) in columns.iter_mut().enumerate() {
+                            let dtype = arrow_fields[i].data_type();
+                            match record.get(s) {
+                                Some(value) => {
+                                    deserialize_into(inner, dtype, &[value]);
+                                }
+                                None => {
+                                    deserialize_into(inner, dtype, &[&JSON_NULL_VALUE]);
+                                }
+                            }
+                        }
+                    } else {
+                        Err(super::Error::JsonDeserializationError {
+                            string: "Expected JSON object".to_string(),
+                        })?;
+                    }
+                    num_rows += 1;
+                }
+            }
+            Value::Object(record) => {
+                for (i, (s, inner)) in columns.iter_mut().enumerate() {
+                    let dtype = arrow_fields[i].data_type();
+                    match record.get(s) {
+                        Some(value) => {
+                            deserialize_into(inner, dtype, &[value]);
+                        }
+                        None => {
+                            deserialize_into(inner, dtype, &[&JSON_NULL_VALUE]);
+                        }
+                    }
+                }
+                num_rows += 1;
+            }
+            _ => {
+                return Err(super::Error::JsonDeserializationError {
+                    string: "Expected JSON object".to_string(),
+                }
+                .into());
+            }
+        }
+    }
+    let columns = columns
+        .into_values()
+        .zip(daft_fields)
+        .map(|(mut builder, fld)| Series::from_arrow(fld, builder.finish()))
+        .collect::<DaftResult<Vec<_>>>()?;
+
+    let tbl = RecordBatch::new_unchecked(schema.clone(), columns, num_rows);
+
+    if let Some(pred) = &predicate {
+        let pred = BoundExpr::try_new(pred.clone(), &schema)?;
+        tbl.filter(&[pred])
+    } else {
+        Ok(tbl)
+    }
+}
+
+struct JsonReader<'a> {
+    bytes: &'a [u8],
+    schema: SchemaRef,
+    n_threads: usize,
+    predicate: Option<Arc<Expr>>,
+    sample_size: usize,
+    n_rows: Option<usize>,
+    chunk_size: Option<usize>,
+    pool: rayon::ThreadPool,
+}
+
+impl<'a> JsonReader<'a> {
+    fn try_new(
+        bytes: &'a [u8],
+        convert_options: Option<JsonConvertOptions>,
+        parse_options: Option<JsonParseOptions>,
+        read_options: Option<JsonReadOptions>,
+        max_chunks_in_flight: Option<usize>,
+    ) -> DaftResult<Self> {
+        let sample_size = parse_options
+            .as_ref()
+            .and_then(|options| options.sample_size)
+            .unwrap_or(1024);
+        let n_rows = convert_options.as_ref().and_then(|options| options.limit);
+        let chunk_size = read_options.as_ref().and_then(|options| options.chunk_size);
+        let predicate = convert_options
+            .as_ref()
+            .and_then(|options| options.predicate.clone());
+
+        let n_threads: usize = std::thread::available_parallelism()
+            .unwrap_or(NonZeroUsize::new(2).unwrap())
+            .into();
+
+        let schema = match convert_options
+            .as_ref()
+            .and_then(|options| options.schema.as_ref())
+        {
+            Some(schema) => schema.clone(),
+            None => Arc::new(infer_schema(bytes, None, None)?.try_into()?),
+        };
+
+        let pool = if let Some(max_in_flight) = max_chunks_in_flight {
+            ThreadPoolBuilder::new().num_threads(max_in_flight).build()
+        } else {
+            ThreadPoolBuilder::new().num_threads(n_threads).build()
+        }
+        .context(RayonThreadPoolSnafu)?;
+
+        let projected_schema = match convert_options.and_then(|options| options.include_columns) {
+            Some(projected_columns) => Arc::new(schema.project(&projected_columns)?),
+            None => schema,
+        };
+
+        Ok(Self {
+            bytes,
+            schema: projected_schema,
+            predicate,
+            n_threads,
+            sample_size,
+            n_rows,
+            chunk_size,
+            pool,
+        })
+    }
+
+    pub fn finish_into_tables(&self) -> DaftResult<Vec<RecordBatch>> {
+        let mut bytes = self.bytes;
+        let mut n_threads = self.n_threads;
+        let mut total_rows = 128;
+
+        if let Some((mean, std)) = get_line_stats_json(bytes, self.sample_size) {
+            let line_length_upper_bound = 1.1f32.mul_add(std, mean);
+
+            total_rows = (bytes.len() as f32 / 0.01f32.mul_add(-std, mean)) as usize;
+            if let Some(n_rows) = self.n_rows {
+                total_rows = std::cmp::min(n_rows, total_rows);
+                // the guessed upper bound of the no. of bytes in the file
+                let n_bytes = (line_length_upper_bound * (n_rows as f32)) as usize;
+
+                if n_bytes < bytes.len()
+                    && let Some(pos) = next_line_position(&bytes[n_bytes..])
+                {
+                    bytes = &bytes[..n_bytes + pos];
+                }
+            }
+        }
+
+        if total_rows <= 128 {
+            n_threads = 1;
+        }
+
+        let total_len = bytes.len();
+        let chunk_size = self
+            .chunk_size
+            .unwrap_or_else(|| total_len / n_threads.max(1));
+        let file_chunks = self.get_file_chunks(bytes, total_len, chunk_size);
+
+        let tbls = self.pool.install(|| {
+            file_chunks
+                .into_par_iter()
+                .map(|(start, stop)| {
+                    let chunk = &bytes[start..stop];
+                    self.parse_json_chunk(chunk)
+                })
+                .collect::<DaftResult<Vec<RecordBatch>>>()
+        })?;
+
+        truncate_tables_to_limit(tbls, self.n_rows)
+    }
+
+    fn parse_json_chunk(&self, bytes: &[u8]) -> DaftResult<RecordBatch> {
+        let mut scratch = vec![];
+        let scratch = &mut scratch;
+
+        let daft_fields = self.schema.into_iter().cloned().map(Arc::new);
+
+        let arrow_schema = self.schema.to_arrow()?;
+        let arrow_fields: Vec<_> = arrow_schema.fields().iter().collect();
+
+        // The `RawValue` is a pointer to the original JSON string and does not perform any deserialization.
+        // This is a trick to use the line-based deserializer from serde_json to iterate over the lines
+        // This is more accurate than using a `Lines` iterator.
+        // Ideally, we would instead use a line-based deserializer from simd_json, but that is not available.
+        let iter =
+            serde_json::Deserializer::from_slice(bytes).into_iter::<&serde_json::value::RawValue>();
+
+        let estimated_rows = std::cmp::max(1, memchr::memchr_iter(NEWLINE, bytes).count());
+        let mut columns: IndexMap<Cow<str>, Box<dyn ArrayBuilder>> = arrow_fields
+            .iter()
+            .map(|f| {
+                (
+                    Cow::Owned(f.name().clone()),
+                    allocate_array(f, estimated_rows),
+                )
+            })
+            .collect();
+
+        let mut num_rows = 0;
+        for record in iter {
+            let value = record.map_err(|e| super::Error::JsonDeserializationError {
+                string: e.to_string(),
+            })?;
+            let v = parse_raw_value(value, scratch)?;
+
+            match v {
+                Value::Object(record) => {
+                    for (i, (s, inner)) in columns.iter_mut().enumerate() {
+                        let dtype = arrow_fields[i].data_type();
+                        match record.get(s) {
+                            Some(value) => {
+                                deserialize_into(inner, dtype, &[value]);
+                            }
+                            None => {
+                                deserialize_into(inner, dtype, &[&JSON_NULL_VALUE]);
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    return Err(super::Error::JsonDeserializationError {
+                        string: "Expected JSON object".to_string(),
+                    }
+                    .into());
+                }
+            }
+
+            num_rows += 1;
+        }
+        let columns = columns
+            .into_values()
+            .zip(daft_fields)
+            .map(|(mut builder, fld)| Series::from_arrow(fld, builder.finish()))
+            .collect::<DaftResult<Vec<_>>>()?;
+
+        let tbl = RecordBatch::new_with_size(self.schema.clone(), columns, num_rows)?;
+
+        if let Some(pred) = &self.predicate {
+            let pred = BoundExpr::try_new(pred.clone(), &self.schema)?;
+            tbl.filter(&[pred])
+        } else {
+            Ok(tbl)
+        }
+    }
+
+    /// Get the start and end positions of the chunks of the file
+    fn get_file_chunks(
+        &self,
+        bytes: &[u8],
+        total_len: usize,
+        chunk_size: usize,
+    ) -> Vec<(usize, usize)> {
+        let mut last_pos = 0;
+
+        let mut offsets = Vec::new();
+
+        loop {
+            let search_pos = last_pos + chunk_size;
+
+            if search_pos >= bytes.len() {
+                break;
+            }
+
+            let end_pos = match next_line_position(&bytes[search_pos..]) {
+                Some(pos) => search_pos + pos,
+                None => {
+                    break;
+                }
+            };
+
+            offsets.push((last_pos, end_pos));
+            last_pos = end_pos;
+        }
+
+        if last_pos < total_len {
+            offsets.push((last_pos, total_len));
+        }
+
+        offsets
+    }
+}
+
+// TODO: there should be much more shared code between this and the async version
+fn infer_schema(
+    bytes: &[u8],
+    max_rows: Option<usize>,
+    max_bytes: Option<usize>,
+) -> DaftResult<arrow::datatypes::Schema> {
+    let max_bytes = max_bytes.unwrap_or(1024 * 1024); // todo: make this configurable
+    let max_records = max_rows.unwrap_or(1024); // todo: make this configurable
+
+    let mut total_bytes = 0;
+
+    let mut column_types: IndexMap<String, HashSet<arrow::datatypes::DataType>> = IndexMap::new();
+    let mut scratch = Vec::new();
+    let scratch = &mut scratch;
+
+    let iter =
+        serde_json::Deserializer::from_slice(bytes).into_iter::<&serde_json::value::RawValue>();
+
+    for value in iter.take(max_records) {
+        let value = value?;
+        let bytes = value.get().as_bytes();
+        total_bytes += bytes.len();
+
+        let v = parse_raw_value(value, scratch)?;
+
+        let inferred_schema = infer_records_schema(&v).context(ArrowSnafu)?;
+        for field in inferred_schema.fields() {
+            // Get-and-mutate-or-insert.
+            match column_types.entry(field.name().clone()) {
+                indexmap::map::Entry::Occupied(mut v) => {
+                    v.get_mut().insert(field.data_type().clone());
+                }
+                indexmap::map::Entry::Vacant(v) => {
+                    let mut a = HashSet::new();
+                    a.insert(field.data_type().clone());
+                    v.insert(a);
+                }
+            }
+        }
+        scratch.clear();
+
+        if total_bytes > max_bytes {
+            break;
+        }
+    }
+
+    let fields = column_types_map_to_fields(column_types);
+    Ok(arrow::datatypes::Schema::new(fields))
+}
+
+/// Get the mean and standard deviation of length of lines in bytes
+fn get_line_stats_json(bytes: &[u8], n_lines: usize) -> Option<(f32, f32)> {
+    let mut lengths = Vec::with_capacity(n_lines);
+
+    let mut bytes_trunc;
+    let n_lines_per_iter = n_lines / 2;
+
+    let mut n_read = 0;
+
+    let bytes_len = bytes.len();
+
+    // sample from 0, and 75% in the file
+    for offset in [0, (bytes_len as f32 * 0.75) as usize] {
+        bytes_trunc = &bytes[offset..];
+        let pos = next_line_position(bytes_trunc)?;
+        if pos >= bytes_len {
+            return None;
+        }
+        bytes_trunc = &bytes_trunc[pos + 1..];
+
+        for _ in offset..(offset + n_lines_per_iter) {
+            let pos = next_line_position(bytes_trunc);
+            if let Some(pos) = pos {
+                lengths.push(pos);
+                let next_bytes = &bytes_trunc[pos..];
+                if next_bytes.is_empty() {
+                    return None;
+                }
+                bytes_trunc = next_bytes;
+                n_read += pos;
+            } else {
+                break;
+            }
+        }
+    }
+
+    let n_samples = lengths.len();
+    let mean = (n_read as f32) / (n_samples as f32);
+    let mut std = 0.0;
+    for &len in &lengths {
+        std += (len as f32 - mean).pow(2.0);
+    }
+    std = (std / n_samples as f32).sqrt();
+    Some((mean, std))
+}
+
+#[inline(always)]
+fn parse_raw_value<'a>(
+    raw_value: &'a RawValue,
+    scratch: &'a mut Vec<u8>,
+) -> crate::Result<Value<'a>> {
+    let bytes = raw_value.get().as_bytes();
+    scratch.clear();
+    // We need to clone the bytes here because the deserializer expects a mutable slice
+    // and `RawValue` only provides an immutable slice.
+    scratch.extend_from_slice(bytes);
+    crate::deserializer::to_value(scratch).map_err(|e| super::Error::JsonDeserializationError {
+        string: e.to_string(),
+    })
+}
+
+// TODO: only recognises `}\n` as a line boundary; JSONL rows that are JSON arrays
+// (e.g. `[1,2,3]\n`) will not be detected. This is fine for now because Daft only
+// supports object-per-line JSONL, but should be revisited if array rows are needed.
+fn next_line_position(input: &[u8]) -> Option<usize> {
+    let pos = memchr::memchr(NEWLINE, input)?;
+    if pos == 0 {
+        return Some(1);
+    }
+
+    let is_closing_bracket = input.get(pos - 1) == Some(&CLOSING_BRACKET);
+    if is_closing_bracket {
+        Some(pos + 1)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+
+    use super::*;
+
+    #[test]
+    fn test_infer_schema() {
+        let json = r#"
+{"floats": 1.0, "utf8": "hello", "bools": true}
+{"floats": 2.0, "utf8": "world", "bools": false}
+{"floats": 3.0, "utf8": "!", "bools": true}
+"#;
+
+        let result = infer_schema(json.as_bytes(), None, None);
+        let expected_schema = ArrowSchema::new(vec![
+            ArrowField::new("floats", ArrowDataType::Float64, true),
+            ArrowField::new("utf8", ArrowDataType::LargeUtf8, true),
+            ArrowField::new("bools", ArrowDataType::Boolean, true),
+        ]);
+        assert_eq!(result.unwrap(), expected_schema);
+    }
+
+    #[test]
+    fn test_infer_schema_empty() {
+        let json = r"";
+
+        let result = infer_schema(json.as_bytes(), None, None);
+        let expected_schema = ArrowSchema::empty();
+        assert_eq!(result.unwrap(), expected_schema);
+    }
+
+    #[test]
+    fn test_read_json_from_str() {
+        let json = r#"
+{"floats": 1.0, "utf8": "hello", "bools": true}
+{"floats": 2.0, "utf8": "world", "bools": false}
+{"floats": 3.0, "utf8": "!\\n", "bools": true}
+"#;
+        let reader = JsonReader::try_new(json.as_bytes(), None, None, None, None).unwrap();
+        let tables = reader.finish_into_tables().unwrap();
+        let _result = tables_concat(tables);
+    }
+}

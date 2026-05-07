@@ -1,0 +1,930 @@
+use std::{cmp::Ordering, collections::HashMap, fmt::Debug, future::Future, sync::Arc};
+
+use common_daft_config::DaftExecutionConfig;
+use common_error::DaftError;
+use common_partitioning::PartitionRef;
+use common_resource_request::ResourceRequest;
+use daft_checkpoint::CheckpointId;
+use daft_local_plan::{
+    ExecutionStats, FlightShuffleReadInput, Input, LocalPhysicalPlanRef, SourceId,
+};
+use daft_scan::ScanTaskRef;
+use tokio_util::sync::CancellationToken;
+
+use super::worker::WorkerId;
+use crate::{
+    pipeline_node::{NodeID, PipelineNodeContext, PipelineNodeImpl, PlanFingerprint, TaskOutput},
+    plan::{QueryIdx, TaskIDCounter},
+    scheduling::scheduler::SubmittableTask,
+    utils::channel::{OneshotReceiver, OneshotSender, create_oneshot_channel},
+};
+
+#[derive(Debug, Clone)]
+pub(crate) struct TaskResourceRequest {
+    pub resource_request: ResourceRequest,
+}
+
+impl TaskResourceRequest {
+    pub fn new(resource_request: ResourceRequest) -> Self {
+        Self { resource_request }
+    }
+
+    pub fn num_cpus(&self) -> f64 {
+        self.resource_request.num_cpus().unwrap_or(1.0)
+    }
+
+    pub fn num_gpus(&self) -> f64 {
+        self.resource_request.num_gpus().unwrap_or(0.0)
+    }
+
+    pub fn memory_bytes(&self) -> usize {
+        self.resource_request.memory_bytes().unwrap_or(0)
+    }
+}
+
+pub(crate) type TaskID = u32;
+pub(crate) type TaskName = String;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[allow(clippy::struct_field_names)]
+pub(crate) struct TaskContext {
+    /// The query index that the task belongs to.
+    pub query_idx: QueryIdx,
+    /// The ID of the last operator / node in the task's pipeline.
+    /// This gives us a general indication of what portion of the query this task is related to.
+    pub last_node_id: NodeID,
+    /// The task ID
+    pub task_id: TaskID,
+    pub node_ids: Vec<NodeID>,
+    /// A fingerprint identifying tasks with functionally identical plans.
+    /// Assigned by pipeline nodes: tasks with the same fingerprint have structurally
+    /// identical plans and can share a single pipeline for execution.
+    pub plan_fingerprint: PlanFingerprint,
+    /// Checkpoint identity for this task. Set at build time.
+    pub checkpoint_id: Option<CheckpointId>,
+}
+
+impl TaskContext {
+    pub fn new(
+        query_idx: QueryIdx,
+        node_id: NodeID,
+        task_id: TaskID,
+        node_ids: Vec<NodeID>,
+        plan_fingerprint: PlanFingerprint,
+    ) -> Self {
+        Self {
+            checkpoint_id: Some(CheckpointId::generate(task_id)),
+            query_idx,
+            last_node_id: node_id,
+            task_id,
+            node_ids,
+            plan_fingerprint,
+        }
+    }
+}
+
+impl From<(&PipelineNodeContext, TaskID)> for TaskContext {
+    fn from((node_context, task_id): (&PipelineNodeContext, TaskID)) -> Self {
+        Self::new(
+            node_context.query_idx,
+            node_context.node_id,
+            task_id,
+            vec![node_context.node_id],
+            0,
+        )
+    }
+}
+
+pub(crate) trait TaskPriority: PartialOrd + PartialEq + Ord + Eq + Copy + Clone {}
+
+pub(crate) trait Task: Send + Sync + Clone + Debug + 'static {
+    fn priority(&self) -> impl TaskPriority;
+    fn task_context(&self) -> TaskContext;
+    fn resource_request(&self) -> &TaskResourceRequest;
+    fn strategy(&self) -> &SchedulingStrategy;
+    fn task_id(&self) -> TaskID {
+        self.task_context().task_id
+    }
+
+    #[allow(dead_code)]
+    fn query_idx(&self) -> QueryIdx {
+        self.task_context().query_idx
+    }
+
+    #[allow(dead_code)]
+    fn last_node_id(&self) -> NodeID {
+        self.task_context().last_node_id
+    }
+
+    fn task_name(&self) -> TaskName;
+}
+
+#[derive(Clone)]
+pub(crate) struct TaskDetails {
+    pub name: TaskName,
+    pub resource_request: TaskResourceRequest,
+}
+
+impl TaskDetails {
+    pub fn num_cpus(&self) -> f64 {
+        self.resource_request.num_cpus()
+    }
+
+    pub fn num_gpus(&self) -> f64 {
+        self.resource_request.num_gpus()
+    }
+
+    pub fn memory_bytes(&self) -> usize {
+        self.resource_request.memory_bytes()
+    }
+}
+
+impl<T: Task> From<&T> for TaskDetails {
+    fn from(task: &T) -> Self {
+        Self {
+            name: task.task_name(),
+            resource_request: task.resource_request().clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for TaskDetails {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "TaskDetails(name = {}, resource_request = (num_cpus = {}, num_gpus = {}, memory_bytes = {}))",
+            self.name,
+            self.num_cpus(),
+            self.num_gpus(),
+            self.memory_bytes()
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum SchedulingStrategy {
+    Spread,
+    // TODO: In the future if we run multiple workers on the same node, we can have a NodeAffinity strategy or a multi-worker affinity strategy
+    WorkerAffinity { worker_id: WorkerId, soft: bool },
+}
+
+#[allow(clippy::struct_field_names)]
+#[derive(Debug, Clone, Copy)]
+struct SwordfishTaskPriority {
+    query_idx: QueryIdx,
+    node_id: NodeID,
+    task_id: TaskID,
+}
+
+impl PartialEq for SwordfishTaskPriority {
+    fn eq(&self, other: &Self) -> bool {
+        self.task_id == other.task_id
+            && self.query_idx == other.query_idx
+            && self.node_id == other.node_id
+    }
+}
+
+impl Eq for SwordfishTaskPriority {}
+
+impl PartialOrd for SwordfishTaskPriority {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SwordfishTaskPriority {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Rules for swordfish task priority:
+        // 1. Query Idx: Lower query_idx, higher priority
+        // 2. Node ID:   Higher node_id, higher priority
+        // 3. Task ID:   Lower task_id, higher priority
+        other
+            .query_idx
+            .cmp(&self.query_idx)
+            .then_with(|| self.node_id.cmp(&other.node_id))
+            .then_with(|| other.task_id.cmp(&self.task_id))
+    }
+}
+
+impl TaskPriority for SwordfishTaskPriority {}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SwordfishTask {
+    task_context: TaskContext,
+    plan: LocalPhysicalPlanRef,
+    resource_request: TaskResourceRequest,
+    config: Arc<DaftExecutionConfig>,
+    inputs: HashMap<SourceId, Input>,
+    psets: HashMap<SourceId, Vec<PartitionRef>>,
+    strategy: SchedulingStrategy,
+    context: HashMap<String, String>,
+}
+
+impl SwordfishTask {
+    pub fn plan(&self) -> LocalPhysicalPlanRef {
+        self.plan.clone()
+    }
+
+    pub fn config(&self) -> &Arc<DaftExecutionConfig> {
+        &self.config
+    }
+
+    pub fn inputs(&self) -> &HashMap<SourceId, Input> {
+        &self.inputs
+    }
+
+    pub fn psets(&self) -> &HashMap<SourceId, Vec<PartitionRef>> {
+        &self.psets
+    }
+
+    pub fn context(&self) -> &HashMap<String, String> {
+        &self.context
+    }
+
+    pub fn name(&self) -> String {
+        self.plan.single_line_display()
+    }
+}
+
+impl Task for SwordfishTask {
+    fn task_context(&self) -> TaskContext {
+        self.task_context.clone()
+    }
+
+    fn task_name(&self) -> TaskName {
+        self.name().into()
+    }
+
+    fn resource_request(&self) -> &TaskResourceRequest {
+        &self.resource_request
+    }
+
+    fn strategy(&self) -> &SchedulingStrategy {
+        &self.strategy
+    }
+
+    fn priority(&self) -> impl TaskPriority {
+        SwordfishTaskPriority {
+            query_idx: self.task_context.query_idx,
+            node_id: self.task_context.last_node_id,
+            task_id: self.task_context.task_id,
+        }
+    }
+}
+
+/// Hash multiple u32 values into a PlanFingerprint.
+pub(crate) fn hash_fingerprint(parts: &[u32]) -> PlanFingerprint {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    for part in parts {
+        part.hash(&mut hasher);
+    }
+    hasher.finish() as PlanFingerprint
+}
+
+/// Builder for creating and modifying SwordfishTask instances.
+/// Automatically handles TaskContext creation, config extraction, and context metadata.
+pub(crate) struct SwordfishTaskBuilder {
+    plan: LocalPhysicalPlanRef,
+    config: Arc<DaftExecutionConfig>,
+    inputs: HashMap<SourceId, Input>,
+    psets: HashMap<SourceId, Vec<PartitionRef>>,
+    strategy: Option<SchedulingStrategy>,
+    context: HashMap<String, String>,
+    node_context: Option<PipelineNodeContext>,
+    pending_node_ids: Vec<NodeID>,
+    notify_tokens: Vec<OneshotSender<()>>,
+    /// Fingerprint identifying tasks with functionally identical plans.
+    /// Assigned by pipeline nodes: tasks with the same fingerprint can share a pipeline.
+    plan_fingerprint: PlanFingerprint,
+}
+
+impl SwordfishTaskBuilder {
+    /// Create a new builder from a plan and node.
+    /// Automatically extracts context and config from the node, and adds node_id to pending_node_ids.
+    /// The `plan_fingerprint` identifies tasks with functionally identical plans.
+    pub fn new(
+        plan: LocalPhysicalPlanRef,
+        node: &dyn PipelineNodeImpl,
+        plan_fingerprint: PlanFingerprint,
+    ) -> Self {
+        Self {
+            plan,
+            config: node.config().execution_config.clone(),
+            inputs: HashMap::new(),
+            psets: HashMap::new(),
+            strategy: None,
+            context: node.context().to_hashmap(),
+            node_context: None,
+            pending_node_ids: vec![node.node_id()],
+            notify_tokens: vec![],
+            plan_fingerprint,
+        }
+    }
+
+    /// Get the current plan fingerprint/
+    #[cfg(test)]
+    pub fn fingerprint(&self) -> PlanFingerprint {
+        self.plan_fingerprint
+    }
+
+    /// Fold an additional value into the plan fingerprint.
+    /// Use this when a node produces plans that differ by some parameter
+    /// (e.g., limit value, partition offset).
+    pub fn extend_fingerprint(mut self, value: u32) -> Self {
+        self.plan_fingerprint = hash_fingerprint(&[self.plan_fingerprint, value]);
+        self
+    }
+
+    /// Transform the current plan using a function.
+    /// The function receives the current plan and returns a new plan.
+    /// Automatically adds the node_id from the provided node to pending_node_ids
+    /// and folds the node_id into the plan fingerprint.
+    pub fn map_plan<F>(mut self, node: &dyn PipelineNodeImpl, f: F) -> Self
+    where
+        F: FnOnce(LocalPhysicalPlanRef) -> LocalPhysicalPlanRef,
+    {
+        self.plan = f(self.plan);
+        self.pending_node_ids.push(node.node_id());
+        self.plan_fingerprint = hash_fingerprint(&[self.plan_fingerprint, node.node_id()]);
+        self
+    }
+
+    /// Create a new builder by combining two existing builders.
+    /// The function receives both plans and returns a new plan.
+    /// This allows combining plans from two builders without exposing internals.
+    /// The new builder will have:
+    /// - The combined plan from the function
+    /// - Merged psets from both builders (right takes precedence on conflicts)
+    /// - Config and other fields from the left builder
+    /// - Merged pending_node_ids from both builders, with the node's node_id appended
+    pub fn combine_with<F>(left: &Self, right: &Self, node: &dyn PipelineNodeImpl, f: F) -> Self
+    where
+        F: FnOnce(LocalPhysicalPlanRef, LocalPhysicalPlanRef) -> LocalPhysicalPlanRef,
+    {
+        let combined_plan = f(left.plan.clone(), right.plan.clone());
+
+        let mut inputs = left.inputs.clone();
+        inputs.extend(right.inputs.clone());
+
+        let mut psets = left.psets.clone();
+        psets.extend(right.psets.clone());
+
+        // Merge pending_node_ids from both sides, then add the current node's node_id
+        let mut pending_node_ids = left.pending_node_ids.clone();
+        pending_node_ids.extend(right.pending_node_ids.clone());
+        pending_node_ids.push(node.node_id());
+
+        let plan_fingerprint = hash_fingerprint(&[
+            left.plan_fingerprint,
+            right.plan_fingerprint,
+            node.node_id(),
+        ]);
+
+        Self {
+            plan: combined_plan,
+            config: left.config.clone(),
+            inputs,
+            psets,
+            strategy: left.strategy.clone(),
+            context: left.context.clone(),
+            node_context: left.node_context.clone(),
+            pending_node_ids,
+            notify_tokens: vec![],
+            plan_fingerprint,
+        }
+    }
+
+    /// Conditionally set the scheduling strategy. If None, no-op.
+    pub fn with_strategy(mut self, strategy: Option<SchedulingStrategy>) -> Self {
+        self.strategy = strategy;
+        self
+    }
+
+    /// Add psets with source_id to the builder.
+    pub fn with_psets(mut self, source_id: SourceId, psets: Vec<PartitionRef>) -> Self {
+        self.psets.insert(source_id, psets);
+        self
+    }
+
+    /// Add scan_tasks with source_id to the builder.
+    pub fn with_scan_tasks(mut self, source_id: SourceId, scan_tasks: Vec<ScanTaskRef>) -> Self {
+        self.inputs.insert(source_id, Input::ScanTasks(scan_tasks));
+        self
+    }
+
+    /// Add glob paths with source_id to the builder.
+    pub fn with_glob_paths(mut self, source_id: SourceId, glob_paths: Vec<String>) -> Self {
+        self.inputs.insert(source_id, Input::GlobPaths(glob_paths));
+        self
+    }
+
+    /// Add flight shuffle read inputs with source_id to the builder.
+    pub fn with_flight_shuffle_reads(
+        mut self,
+        source_id: SourceId,
+        inputs: Vec<FlightShuffleReadInput>,
+    ) -> Self {
+        self.inputs.insert(source_id, Input::FlightShuffle(inputs));
+        self
+    }
+
+    /// Add a notify token to the builder. Returns the builder and the receiver for the token.
+    pub fn add_notify_token(mut self) -> (Self, OneshotReceiver<()>) {
+        let (notify_token, notify_rx) = create_oneshot_channel();
+        self.notify_tokens.push(notify_token);
+        (self, notify_rx)
+    }
+
+    /// Build the SubmittableTask directly, which can be submitted to the scheduler.
+    /// The task_id is assigned from the provided task_id_counter at build time.
+    pub fn build(
+        self,
+        query_idx: QueryIdx,
+        task_id_counter: &TaskIDCounter,
+    ) -> SubmittableTask<SwordfishTask> {
+        let strategy = self.strategy.unwrap_or(SchedulingStrategy::Spread);
+
+        let plan_fingerprint = hash_fingerprint(&[self.plan_fingerprint, query_idx as u32]);
+
+        let task_id = task_id_counter.next();
+        let task_context = TaskContext {
+            query_idx,
+            last_node_id: *self
+                .pending_node_ids
+                .last()
+                .expect("Pending node_ids must be non-empty"),
+            task_id,
+            node_ids: self.pending_node_ids,
+            plan_fingerprint,
+            checkpoint_id: Some(CheckpointId::generate(task_id)),
+        };
+
+        // Build context HashMap with task_id, plan_fingerprint, and checkpoint_id
+        let mut context = self.context;
+        context.insert("task_id".to_string(), task_context.task_id.to_string());
+        context.insert("plan_fingerprint".to_string(), plan_fingerprint.to_string());
+        if let Some(ref id) = task_context.checkpoint_id {
+            context.insert("checkpoint_id".to_string(), id.to_string());
+        }
+
+        // Extract resource_request from plan
+        let resource_request = TaskResourceRequest::new(self.plan.resource_request());
+
+        let task = SwordfishTask {
+            task_context,
+            plan: self.plan,
+            resource_request,
+            config: self.config.clone(),
+            inputs: self.inputs,
+            psets: self.psets,
+            strategy,
+            context,
+        };
+
+        let cancel_token = CancellationToken::new();
+        SubmittableTask::new(task, cancel_token, self.notify_tokens)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum TaskStatus {
+    Success {
+        result: TaskOutput,
+        stats: ExecutionStats,
+    },
+    Failed {
+        error: DaftError,
+    },
+    Cancelled,
+    WorkerDied,
+    WorkerUnavailable,
+}
+
+pub(crate) trait TaskResultHandle: Send + Sync {
+    fn task_context(&self) -> TaskContext;
+    fn get_result(&mut self) -> impl Future<Output = TaskStatus> + Send + 'static;
+    fn cancel_callback(&mut self);
+}
+
+pub(crate) struct TaskResultAwaiter<H: TaskResultHandle> {
+    handle: H,
+    cancel_token: CancellationToken,
+}
+
+impl<H: TaskResultHandle> TaskResultAwaiter<H> {
+    pub fn new(handle: H, cancel_token: CancellationToken) -> Self {
+        Self {
+            handle,
+            cancel_token,
+        }
+    }
+
+    pub async fn await_result(mut self) -> TaskStatus {
+        tokio::select! {
+            biased;
+            () = self.cancel_token.cancelled() => {
+                self.handle.cancel_callback();
+                TaskStatus::Cancelled
+            }
+            result = self.handle.get_result() => {
+                result
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use std::{any::Any, sync::Mutex, time::Duration};
+
+    use common_error::DaftError;
+    use common_partitioning::Partition;
+
+    use super::*;
+    use crate::utils::channel::OneshotSender;
+
+    #[derive(Debug)]
+    pub struct MockPartition {
+        num_rows: usize,
+        size_bytes: usize,
+    }
+
+    impl MockPartition {
+        pub fn new(num_rows: usize, size_bytes: usize) -> Self {
+            Self {
+                num_rows,
+                size_bytes,
+            }
+        }
+    }
+
+    impl Partition for MockPartition {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn size_bytes(&self) -> usize {
+            self.size_bytes
+        }
+
+        fn num_rows(&self) -> usize {
+            self.num_rows
+        }
+    }
+
+    pub fn create_mock_partition_ref(num_rows: usize, size_bytes: usize) -> PartitionRef {
+        Arc::new(MockPartition::new(num_rows, size_bytes))
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct MockTaskPriority {
+        priority: usize,
+    }
+
+    impl TaskPriority for MockTaskPriority {}
+
+    #[derive(Debug, Clone)]
+    pub struct MockTask {
+        task_context: TaskContext,
+        task_name: TaskName,
+        priority: MockTaskPriority,
+        scheduling_strategy: SchedulingStrategy,
+        resource_request: TaskResourceRequest,
+        task_result: TaskOutput,
+        cancel_notifier: Arc<Mutex<Option<OneshotSender<()>>>>,
+        sleep_duration: Option<std::time::Duration>,
+        failure: Option<MockTaskFailure>,
+    }
+
+    #[derive(Debug, Clone)]
+    pub enum MockTaskFailure {
+        Error(String),
+        Panic(String),
+        WorkerDied,
+        WorkerUnavailable,
+    }
+
+    /// A builder pattern implementation for creating MockTask instances
+    pub struct MockTaskBuilder {
+        task_context: TaskContext,
+        task_name: TaskName,
+        priority: MockTaskPriority,
+        scheduling_strategy: SchedulingStrategy,
+        task_result: TaskOutput,
+        resource_request: TaskResourceRequest,
+        cancel_notifier: Arc<Mutex<Option<OneshotSender<()>>>>,
+        sleep_duration: Option<Duration>,
+        failure: Option<MockTaskFailure>,
+    }
+
+    impl Default for MockTaskBuilder {
+        fn default() -> Self {
+            Self::new(create_mock_partition_ref(100, 100))
+        }
+    }
+
+    impl MockTaskBuilder {
+        /// Create a new MockTaskBuilder with required parameters
+        pub fn new(partition_ref: PartitionRef) -> Self {
+            let task_context = TaskContext::default();
+            let task_id = task_context.task_id;
+            Self {
+                task_context,
+                task_name: String::new(),
+                priority: MockTaskPriority { priority: 0 },
+                scheduling_strategy: SchedulingStrategy::Spread,
+                resource_request: TaskResourceRequest::new(ResourceRequest::default()),
+                task_result: TaskOutput::Materialized(
+                    crate::pipeline_node::MaterializedOutput::new(
+                        vec![partition_ref],
+                        "".into(),
+                        String::new(),
+                        task_id,
+                    ),
+                ),
+                cancel_notifier: Arc::new(Mutex::new(None)),
+                sleep_duration: None,
+                failure: None,
+            }
+        }
+
+        pub fn with_priority(mut self, priority: usize) -> Self {
+            self.priority = MockTaskPriority { priority };
+            self
+        }
+
+        pub fn with_resource_request(mut self, resource_request: ResourceRequest) -> Self {
+            self.resource_request = TaskResourceRequest::new(resource_request);
+            self
+        }
+
+        pub fn with_scheduling_strategy(mut self, scheduling_strategy: SchedulingStrategy) -> Self {
+            self.scheduling_strategy = scheduling_strategy;
+            self
+        }
+
+        /// Set a custom task ID (defaults to a UUID if not specified)
+        pub fn with_task_id(mut self, task_id: TaskID) -> Self {
+            self.task_context.task_id = task_id;
+            self
+        }
+
+        /// Set a cancel marker
+        pub fn with_cancel_notifier(mut self, cancel_notifier: OneshotSender<()>) -> Self {
+            self.cancel_notifier = Arc::new(Mutex::new(Some(cancel_notifier)));
+            self
+        }
+
+        /// Set a sleep duration
+        pub fn with_sleep_duration(mut self, sleep_duration: Duration) -> Self {
+            self.sleep_duration = Some(sleep_duration);
+            self
+        }
+
+        pub fn with_failure(mut self, failure: MockTaskFailure) -> Self {
+            self.failure = Some(failure);
+            self
+        }
+
+        /// Build the MockTask
+        pub fn build(self) -> MockTask {
+            MockTask {
+                task_context: self.task_context,
+                task_name: self.task_name,
+                priority: self.priority,
+                scheduling_strategy: self.scheduling_strategy,
+                resource_request: self.resource_request,
+                task_result: self.task_result,
+                cancel_notifier: self.cancel_notifier,
+                sleep_duration: self.sleep_duration,
+                failure: self.failure,
+            }
+        }
+    }
+
+    impl Task for MockTask {
+        fn task_context(&self) -> TaskContext {
+            self.task_context.clone()
+        }
+
+        fn priority(&self) -> impl TaskPriority {
+            self.priority
+        }
+
+        fn resource_request(&self) -> &TaskResourceRequest {
+            &self.resource_request
+        }
+
+        fn strategy(&self) -> &SchedulingStrategy {
+            &self.scheduling_strategy
+        }
+
+        fn task_name(&self) -> TaskName {
+            self.task_name.clone()
+        }
+    }
+
+    /// A mock implementation of the SwordfishTaskResultHandle trait for testing
+    pub struct MockTaskResultHandle {
+        task: MockTask,
+    }
+
+    impl MockTaskResultHandle {
+        pub fn new(task: MockTask) -> Self {
+            Self { task }
+        }
+    }
+
+    impl TaskResultHandle for MockTaskResultHandle {
+        fn task_context(&self) -> TaskContext {
+            self.task.task_context.clone()
+        }
+
+        fn get_result(&mut self) -> impl Future<Output = TaskStatus> + Send + 'static {
+            let task = self.task.clone();
+
+            async move {
+                if let Some(sleep_duration) = task.sleep_duration {
+                    tokio::time::sleep(sleep_duration).await;
+                }
+                if let Some(failure) = task.failure {
+                    match failure {
+                        MockTaskFailure::Error(error_message) => {
+                            return TaskStatus::Failed {
+                                error: DaftError::InternalError(error_message),
+                            };
+                        }
+                        MockTaskFailure::Panic(error_message) => {
+                            panic!("{}", error_message);
+                        }
+                        MockTaskFailure::WorkerDied => {
+                            return TaskStatus::WorkerDied;
+                        }
+                        MockTaskFailure::WorkerUnavailable => {
+                            return TaskStatus::WorkerUnavailable;
+                        }
+                    }
+                }
+                TaskStatus::Success {
+                    result: task.task_result,
+                    stats: ExecutionStats::new("".into(), vec![]),
+                }
+            }
+        }
+
+        fn cancel_callback(&mut self) {
+            let mut cancel_notifier = self
+                .task
+                .cancel_notifier
+                .lock()
+                .expect("Failed to lock cancel_notifier");
+            if let Some(cancel_notifier) = cancel_notifier.take() {
+                let _ = cancel_notifier.send(());
+            }
+        }
+    }
+
+    #[test]
+    fn test_swordfish_task_priority_ordering() {
+        // Test cases for priority ordering:
+        // Lower query_idx, higher stage_id, higher node_id, lower task_id should have higher priority
+
+        // Test 1: Different query_idxs (lower query_idx should have higher priority)
+        let task1 = SwordfishTaskPriority {
+            query_idx: 1,
+            node_id: 1,
+            task_id: 1,
+        };
+        let task2 = SwordfishTaskPriority {
+            query_idx: 2,
+            node_id: 1,
+            task_id: 1,
+        };
+        assert!(task1 > task2); // query_idx 1 < query_idx 2, so task1 has higher priority (larger in ordering)
+
+        // Test 2: Same query_idx, different task_ids (higher task_id should have higher priority)
+        let task1 = SwordfishTaskPriority {
+            query_idx: 1,
+            node_id: 2,
+            task_id: 1,
+        };
+        let task2 = SwordfishTaskPriority {
+            query_idx: 1,
+            node_id: 1,
+            task_id: 1,
+        };
+        assert!(task1 > task2); // node_id 2 > node_id 1, so task1 has higher priority (larger in ordering)
+
+        // Test 3: Same query_idx and node_id, different task_ids (lower task_id should have higher priority)
+        let task1 = SwordfishTaskPriority {
+            query_idx: 1,
+            node_id: 1,
+            task_id: 1,
+        };
+        let task2 = SwordfishTaskPriority {
+            query_idx: 1,
+            node_id: 1,
+            task_id: 2,
+        };
+        assert!(task1 > task2); // task_id 1 < task_id 2, so task1 has higher priority (larger in ordering)
+
+        // Test 4: Complex case with multiple differences
+        let task1 = SwordfishTaskPriority {
+            query_idx: 1,
+            node_id: 2,
+            task_id: 1,
+        };
+        let task2 = SwordfishTaskPriority {
+            query_idx: 2,
+            node_id: 1,
+            task_id: 1,
+        };
+        assert!(task1 > task2); // task1 has lower query_idx, so it has higher priority (larger in ordering)
+
+        // Test 5: Equality
+        let task1 = SwordfishTaskPriority {
+            query_idx: 1,
+            node_id: 1,
+            task_id: 1,
+        };
+        let task2 = SwordfishTaskPriority {
+            query_idx: 1,
+            node_id: 1,
+            task_id: 1,
+        };
+        assert_eq!(task1, task2);
+    }
+
+    #[test]
+    fn test_swordfish_task_priority_binary_heap() {
+        use std::collections::BinaryHeap;
+
+        // Test that tasks are correctly ordered in a binary heap
+        // Higher priority tasks are now "larger" and come out first
+        let mut heap = BinaryHeap::new();
+
+        // Add tasks in random order - ensuring unique task_ids within each stage
+        heap.push(SwordfishTaskPriority {
+            query_idx: 2,
+            node_id: 1,
+            task_id: 1,
+        });
+        heap.push(SwordfishTaskPriority {
+            query_idx: 1,
+            node_id: 2,
+            task_id: 3,
+        });
+        heap.push(SwordfishTaskPriority {
+            query_idx: 1,
+            node_id: 1,
+            task_id: 2,
+        });
+        heap.push(SwordfishTaskPriority {
+            query_idx: 1,
+            node_id: 1,
+            task_id: 1,
+        });
+
+        // Pop tasks in order (BinaryHeap is a max heap, so highest priority comes out first)
+        // Expected order (highest priority to lowest priority):
+        // 1. query_idx=1, stage_id=1, node_id=2, task_id=3 (higher node_id = higher priority = larger in heap)
+        // 2. query_idx=1, stage_id=1, node_id=1, task_id=1 (lower task_id = higher priority = larger in heap)
+        // 3. query_idx=1, stage_id=1, node_id=1, task_id=2 (higher task_id = lower priority = smaller in heap)
+        // 4. query_idx=2, stage_id=1, node_id=1, task_id=1 (higher query_idx = lowest priority = smallest in heap)
+
+        assert_eq!(
+            heap.pop().unwrap(),
+            SwordfishTaskPriority {
+                query_idx: 1,
+                node_id: 2,
+                task_id: 3
+            }
+        );
+        assert_eq!(
+            heap.pop().unwrap(),
+            SwordfishTaskPriority {
+                query_idx: 1,
+                node_id: 1,
+                task_id: 1
+            }
+        );
+        assert_eq!(
+            heap.pop().unwrap(),
+            SwordfishTaskPriority {
+                query_idx: 1,
+                node_id: 1,
+                task_id: 2
+            }
+        );
+        assert_eq!(
+            heap.pop().unwrap(),
+            SwordfishTaskPriority {
+                query_idx: 2,
+                node_id: 1,
+                task_id: 1
+            }
+        );
+        assert!(heap.pop().is_none()); // Heap should be empty
+    }
+}

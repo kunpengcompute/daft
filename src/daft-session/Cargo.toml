@@ -1,0 +1,28 @@
+[dependencies]
+common-error = {workspace = true}
+daft-ai = {workspace = true}
+daft-catalog = {workspace = true}
+daft-core = {workspace = true}
+daft-dsl = {workspace = true}
+daft-ext = {workspace = true}
+daft-ext-internal = {workspace = true}
+daft-logical-plan = {workspace = true}
+pyo3 = {workspace = true, optional = true}
+uuid = {workspace = true}
+
+[features]
+python = [
+  "dep:pyo3",
+  "daft-ai/python",
+  "daft-catalog/python",
+  "daft-core/python",
+  "daft-logical-plan/python"
+]
+
+[lints]
+workspace = true
+
+[package]
+name = "daft-session"
+edition.workspace = true
+version.workspace = true

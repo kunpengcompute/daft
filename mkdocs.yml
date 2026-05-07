@@ -1,0 +1,204 @@
+# Documentation: https://squidfunk.github.io/mkdocs-material/
+
+# Project Information
+site_name: Daft Documentation
+site_author: Eventual
+site_url: https://docs.daft.ai/en/stable/
+site_description: |
+  Welcome to Daft Documentation! Daft is a high-performance data engine providing simple and reliable data processing for any modality and scale.
+copyright: '&copy; Copyright 2025, Eventual <img referrerpolicy="no-referrer-when-downgrade" src="https://static.scarf.sh/a.png?x-pxid=2293a436-7808-4c74-9bf3-d3e86e4eed91" />'
+# Repository
+repo_name: Daft
+repo_url: https://github.com/Eventual-Inc/Daft
+# Sitemap now managed by mkdocs-literate-nav plugin in docs/SUMMARY.md
+# Configuration
+theme:
+  name: material
+  locale: en
+  logo: img/daft.png
+  favicon: img/favicon.png
+  font:
+    text: Oxygen
+    code: Consolas
+  features:
+  - search.suggest
+  - search.highlight
+  - content.code.copy   # add copy button to code sections
+  - content.tabs.link   # If one tab switches Python to SQL, all tabs switch
+  - toc.follow
+  - navigation.footer
+  - navigation.tracking   # url in address bar is automatically updated with active anchor as highlighted in TOC
+  - navigation.tabs   # moves nav bar to top, with secondary left-hand menu
+  - navigation.tabs.sticky   # top nav bar remains visible when scrolling down
+  - navigation.top   # back-to-top button
+  - navigation.instant
+  - navigation.indexes
+  - navigation.expand   # expand navigation sections by default
+  palette:
+  - media: (prefers-color-scheme)
+    toggle:
+      icon: material/white-balance-sunny
+      name: Switch to light mode
+  - media: "(prefers-color-scheme: light)"
+    scheme: default
+    primary: custom
+    accent: custom
+    toggle:
+      icon: material/weather-night
+      name: Switch to dark mode
+  - media: "(prefers-color-scheme: dark)"
+    scheme: slate
+    primary: black
+    accent: custom
+    toggle:
+      icon: material/theme-light-dark
+      name: Switch to system preference
+  icon:
+    repo: fontawesome/brands/github
+    admonition:
+      quote: octicons/question-16
+  custom_dir: docs/overrides
+# Additional Configuration
+extra:
+  analytics:
+    provider: google
+    property: G-YN4QSRPV0K
+  social:
+  - icon: fontawesome/brands/github
+    link: https://github.com/Eventual-Inc/Daft
+  - icon: fontawesome/brands/slack
+    link: https://www.daft.ai/slack
+  - icon: fontawesome/brands/linkedin
+    link: https://www.linkedin.com/showcase/daftengine/
+  - icon: fontawesome/brands/x-twitter
+    link: https://x.com/daftengine
+  - icon: fontawesome/brands/youtube
+    link: https://www.youtube.com/@daftengine
+  - icon: fontawesome/solid/blog
+    link: https://www.daft.ai/blog
+  generator: false
+# Additional Style
+extra_css:
+- css/extra.css
+- css/docsearch.css
+- https://cdn.jsdelivr.net/npm/@docsearch/css@3
+extra_javascript:
+- js/reo.js
+- js/custom.js
+- js/docsearch.js
+- js/install-tool.js
+- https://cdn.jsdelivr.net/npm/@docsearch/js@3
+- js/readthedocs.js
+# Extensions
+markdown_extensions:
+- admonition
+- toc:
+    toc_depth: 4
+    permalink: "#"
+- pymdownx.tabbed:
+    alternate_style: true
+- pymdownx.snippets:
+    check_paths: true
+- pymdownx.superfences
+- pymdownx.details
+- attr_list
+- md_in_html
+- pymdownx.emoji:
+    emoji_index: !!python/name:material.extensions.emoji.twemoji
+    emoji_generator: !!python/name:material.extensions.emoji.to_svg
+    options:
+      custom_icons: [overrides/.icons]
+- pymdownx.highlight:
+    linenums: true
+# Plugins
+plugins:
+- markdown-exec
+- search:
+    separator: '[\s\u200b\-_,:!=\[\]()"`/]+|\.(?!\d)|&[lg]t;|(?!\b)(?=[A-Z][a-z])'
+- autorefs:
+    resolve_closest: true
+- minify:
+    minify_html: true
+    minify_css: true
+- redirects:
+    redirect_maps:
+      integrations/aws.md: connectors/aws.md
+      io/aws.md: connectors/aws.md
+      integrations/hudi.md: connectors/hudi.md
+      io/hudi.md: connectors/hudi.md
+      integrations/iceberg.md: connectors/iceberg.md
+      io/iceberg.md: connectors/iceberg.md
+      integrations/delta_lake.md: connectors/delta_lake.md
+      io/delta_lake.md: connectors/delta_lake.md
+      integrations/huggingface.md: connectors/huggingface.md
+      io/huggingface.md: connectors/huggingface.md
+      integrations/azure.md: connectors/azure.md
+      io/azure.md: connectors/azure.md
+      integrations/sql.md: connectors/sql.md
+      io/sql.md: connectors/sql.md
+      integrations/glue.md: connectors/glue.md
+      catalogs/glue.md: connectors/glue.md
+      integrations/s3tables.md: connectors/s3tables.md
+      catalogs/s3tables.md: connectors/s3tables.md
+      integrations/unity_catalog.md: connectors/unity_catalog.md
+      catalogs/unity_catalog.md: connectors/unity_catalog.md
+      integrations/gravitino.md: connectors/gravitino.md
+      catalogs/gravitino.md: connectors/gravitino.md
+      integrations.md: connectors/index.md
+      io/index.md: connectors/index.md
+      sql_overview.md: sql/index.md
+      sessions.md: api/sessions.md
+      resources/architecture.md: architecture/index.md
+      advanced/memory.md: optimization/memory.md
+      advanced/partitioning.md: optimization/partitioning.md
+      advanced/observability.md: observability/progress-indicators.md
+      optimization/observability.md: observability/progress-indicators.md
+      optimization/logging.md: observability/logging.md
+      resources/telemetry.md: telemetry.md
+      resources/engine_comparison.md: index.md
+      resources/tutorials.md: examples/index.md
+      migration/dask_migration.md: index.md
+      resources/benchmarks/tpch.md: benchmarks/index.md
+      core_concepts.md: index.md
+      api/datatypes/index.md: api/datatypes/all_datatypes.md
+      modalities/urls.md: modalities/files.md
+- mkdocstrings:
+    custom_templates: docs/templates
+    handlers:
+      python:
+        options:
+          docstring_style: google
+          docstring_section_style: table
+          heading_level: 2
+          line_length: 60
+          merge_init_into_class: true
+          members_order: alphabetical   # or source
+          separate_signature: true
+          show_bases: false
+          show_labels: false
+          show_if_no_docstring: true
+          show_root_full_path: false
+          show_root_heading: true
+          show_signature_annotations: true
+          show_source: true
+          show_symbol_type_heading: true
+          show_symbol_type_toc: true
+          signature_crossrefs: true
+          unwrap_annotated: true
+          summary:
+            attributes: true
+            functions: true
+          extra:
+            trim_doctest_flags: true
+- gen-files:
+    scripts:
+    - docs/gen_pages/gen_function_pages.py
+    - docs/gen_pages/gen_txt_files.py
+    - docs/gen_pages/generate_llms_txt.py
+- literate-nav:
+    nav_file: SUMMARY.md
+- nav-hide-children:
+    hide_children:
+    - ["Python API", "Functions"]
+hooks:
+- docs/hooks.py

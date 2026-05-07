@@ -1,0 +1,69 @@
+[dependencies]
+arrow = {workspace = true}
+arrow-row = {workspace = true}
+bincode = {workspace = true}
+bytemuck = {version = "1", features = ["derive"]}
+chrono = {workspace = true}
+chrono-tz = {workspace = true}
+comfy-table = {workspace = true}
+common-arrow-ffi = {path = "../common/arrow-ffi", default-features = false, optional = true}
+common-display = {path = "../common/display", default-features = false}
+common-error = {path = "../common/error", default-features = false}
+common-hashable-float-wrapper = {path = "../common/hashable-float-wrapper"}
+common-image = {workspace = true}
+common-io-config = {path = "../common/io-config", default-features = false}
+common-ndarray = {workspace = true}
+common-py-serde = {path = "../common/py-serde", default-features = false}
+daft-hash = {workspace = true}
+daft-minhash = {path = "../daft-minhash", default-features = false}
+daft-schema = {path = "../daft-schema", default-features = false}
+daft-sketch = {path = "../daft-sketch", default-features = false}
+derive_more = {workspace = true}
+fastrand = "2.1.0"
+smallvec = {workspace = true}
+html-escape = {workspace = true}
+hyperloglog = {path = "../hyperloglog"}
+image = {workspace = true, features = [
+  "gif",
+  "jpeg",
+  "ico",
+  "png",
+  "tiff",
+  "webp",
+  "bmp",
+  "hdr"
+]}
+indexmap = {workspace = true, features = ["serde"]}
+itertools = {workspace = true}
+mur3 = "0.1.0"
+num-traits = {workspace = true}
+pyo3 = {workspace = true, optional = true}
+rand = {workspace = true}
+serde = {workspace = true}
+sketches-ddsketch = {workspace = true}
+xxhash-rust = {workspace = true}
+uuid = {workspace = true}
+
+[dev-dependencies]
+rstest = {workspace = true}
+
+[features]
+python = [
+  "dep:common-arrow-ffi",
+  "common-display/python",
+  "common-error/python",
+  "common-image/python",
+  "common-io-config/python",
+  "common-ndarray/python",
+  "common-py-serde/python",
+  "daft-schema/python",
+  "dep:pyo3"
+]
+
+[lints]
+workspace = true
+
+[package]
+edition = {workspace = true}
+name = "daft-core"
+version = {workspace = true}

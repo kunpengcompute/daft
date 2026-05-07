@@ -1,0 +1,455 @@
+from __future__ import annotations
+
+import pytest
+
+import daft
+from daft import col
+
+# see:
+#  - https://docs.python.org/3/library/codecs.html#text-encodings
+#  - https://docs.python.org/3/library/codecs.html#binary-transforms
+
+TEXT = b"""
+Every great magic trick consists of three parts or acts. The first part is
+called "The Pledge". The magician shows you something ordinary: a deck of
+cards, a bird or a man. He shows you this object. Perhaps he asks you to
+inspect it to see if it is indeed real, unaltered, normal. But of course...
+it probably isn't. The second act is called "The Turn". The magician takes
+the ordinary something and makes it do something extraordinary. Now you're
+looking for the secret... but you won't find it, because of course you're
+not really looking. You don't really want to know. You want to be fooled.
+But you wouldn't clap yet. Because making something disappear isn't enough;
+you have to bring it back. That's why every magic trick has a third act,
+the hardest part, the part we call "The Prestige". - Christopher Priest.
+""" + bytes("🔥", encoding="utf-8")
+
+###
+# helpers
+###
+
+
+def _assert_eq(actual, expect):
+    actual.to_pydict() == expect.to_pydict()
+
+
+def _test_codec(codec: str, buff: bytes):
+    _test_compress(codec, input=TEXT, output=buff)
+    _test_decompress(codec, input=buff, output=TEXT)
+    _test_codec_roundtrip(codec, input=TEXT)
+
+
+def _test_compress(codec: str, input: bytes, output: bytes):
+    df = daft.from_pydict({"v": [input]})
+    actual = df.select(col("v").compress(codec))
+    expect = daft.from_pydict({"v": [output]})
+    _assert_eq(actual, expect)
+
+
+def _test_decompress(codec: str, input: bytes, output: bytes):
+    df = daft.from_pydict({"v": [input]})
+    actual = df.select(col("v").decompress(codec))
+    expect = daft.from_pydict({"v": [output]})
+    _assert_eq(actual, expect)
+
+
+def _test_codec_roundtrip(codec: str, input: bytes):
+    df1 = daft.from_pydict({"v": [input]})
+    df2 = df1.select(col("v").compress(codec).decompress(codec))
+    _assert_eq(df1, df2)
+
+
+def _test_charset(charset: str, buff: bytes):
+    _test_encode(charset, input=TEXT, output=buff)
+    _test_decode(charset, input=buff, output=TEXT)
+    _test_charset_roundtrip(charset, input=TEXT)
+
+
+def _test_encode(charset: str, input: bytes, output: bytes):
+    df = daft.from_pydict({"v": [input]})
+    actual = df.select(col("v").encode(charset))
+    expect = daft.from_pydict({"v": [output]})
+    _assert_eq(actual, expect)
+
+
+def _test_decode(charset: str, input: bytes, output: bytes):
+    df = daft.from_pydict({"v": [input]})
+    actual = df.select(col("v").decode(charset))
+    expect = daft.from_pydict({"v": [output]})
+    _assert_eq(actual, expect)
+
+
+def _test_charset_roundtrip(charset: str, input: bytes):
+    df1 = daft.from_pydict({"v": [input]})
+    df2 = df1.select(col("v").encode(charset).decode(charset))
+    _assert_eq(df1, df2)
+
+
+def test_null_handling():
+    import zlib
+
+    #
+    df1 = daft.from_pydict({"v": [None, zlib.compress(TEXT)]})
+    df2 = daft.from_pydict({"v": [zlib.compress(TEXT), None]})
+    result1 = df1.select(col("v").decompress("zlib")).to_pydict()
+    result2 = df2.select(col("v").decompress("zlib")).to_pydict()
+    #
+    # assert validity is included
+    assert result1["v"][0] is None
+    assert result2["v"][1] is None
+
+
+def test_with_strings():
+    import zlib
+
+    _test_compress("zlib", input=str(TEXT), output=zlib.compress(TEXT))
+
+
+###
+# codecs
+###
+
+
+def test_codec_deflate():
+    import zlib
+
+    # https://stackoverflow.com/questions/1089662/python-inflate-and-deflate-implementations
+    # strip 2-byte zlib header and the 4-byte checksum
+    _test_codec("deflate", buff=zlib.compress(TEXT)[2:-4])
+
+
+def test_codec_gzip():
+    import gzip
+
+    _test_codec("gz", buff=gzip.compress(TEXT))
+    _test_codec("gzip", buff=gzip.compress(TEXT))
+
+
+def test_codec_zlib():
+    import zlib
+
+    _test_codec("zlib", buff=zlib.compress(TEXT))
+
+
+def test_charset_base64():
+    import base64
+
+    _test_charset("base64", buff=base64.b64encode(TEXT))
+
+
+def test_charset_hex():
+    import binascii
+
+    # Test binary to hex encoding/decoding
+    _test_encode("hex", input=TEXT, output=binascii.hexlify(TEXT).upper())
+    _test_decode("hex", input=binascii.hexlify(TEXT).upper(), output=TEXT)
+    _test_charset_roundtrip("hex", input=TEXT)
+
+    # Test string to hex encoding/decoding
+    text_str = TEXT.decode("utf-8")
+    _test_encode("hex", input=text_str, output=binascii.hexlify(TEXT).upper())
+
+    # Test specific byte values to hex
+    # Test single byte
+    single_byte = b"\x01"
+    single_byte_hex = b"01"
+    _test_encode("hex", input=single_byte, output=single_byte_hex)
+    _test_decode("hex", input=single_byte_hex, output=single_byte)
+
+    # Test hello string
+    hello_bytes = b"hello"
+    hello_hex = b"68656C6C6F"
+    _test_encode("hex", input=hello_bytes, output=hello_hex)
+    _test_decode("hex", input=hello_hex, output=hello_bytes)
+
+    # Test different lengths of bytes
+    test_bytes = [
+        b"",
+        b"\x00",
+        b"\xff",
+        b"\x00\x01",
+        b"\x01\x23\x45\x67",
+        b"\x89\xab\xcd\xef",
+    ]
+    for bytes_val in test_bytes:
+        expected_hex = binascii.hexlify(bytes_val).upper()
+        _test_encode("hex", input=bytes_val, output=expected_hex)
+        _test_decode("hex", input=expected_hex, output=bytes_val)
+
+    # Test mixed case hex decoding
+    mixed_case_hex = b"68656c6c6f"  # lowercase 'hello'
+    _test_decode("hex", input=mixed_case_hex, output=b"hello")
+
+    # Test numeric to hex encoding/decoding
+    #  Numeric input is first cast to string, then to hex
+    test_numbers = [0, 1, 10, 15, 16, 255, 256, 1024, 65535, 1000000]
+    for num in test_numbers:
+        num_str = str(num)
+        num_bytes = num_str.encode("utf-8")
+        expected_hex = binascii.hexlify(num_bytes).upper()
+        _test_encode("hex", input=num_str, output=expected_hex)
+
+    # Test try_encode and try_decode with hex
+    df = daft.from_pydict({"v": [b"hello", None, b"\x01"]})
+    result = df.select(col("v").try_encode("hex").alias("try_encode"), col("v").encode("hex").alias("encode"))
+    assert result.to_pydict()["try_encode"][0] is not None
+    assert result.to_pydict()["try_encode"][1] is None
+    assert result.to_pydict()["try_encode"][2] is not None
+    assert result.to_pydict()["try_encode"] == result.to_pydict()["encode"]
+
+    # Test edge cases for hex decoding
+    # Test with odd length hex strings
+    odd_hex = b"68656c6c6"  # 9 characters instead of 10
+    df = daft.from_pydict({"v": [odd_hex]})
+    result = df.select(col("v").try_decode("hex").alias("decoded"))
+    assert result.to_pydict()["decoded"][0] is None
+
+    # Test with non-hex characters
+    non_hex = b"68656c6c6g"  # 'g' is not a hex character
+    df = daft.from_pydict({"v": [non_hex]})
+    result = df.select(col("v").try_decode("hex").alias("decoded"))
+    assert result.to_pydict()["decoded"][0] is None
+
+    # Test with whitespace in hex strings
+    whitespace_hex = b"68 65 6c 6c 6f"  # with spaces
+    df = daft.from_pydict({"v": [whitespace_hex]})
+    result = df.select(col("v").try_decode("hex").alias("decoded"))
+    assert result.to_pydict()["decoded"][0] is None
+
+    # Test with very long hex strings
+    long_bytes = b"a" * 1000
+    long_hex = binascii.hexlify(long_bytes).upper()
+    _test_encode("hex", input=long_bytes, output=long_hex)
+    _test_decode("hex", input=long_hex, output=long_bytes)
+
+    # Test with different character cases in hex strings
+    mixed_case_hex2 = b"68656C6C6F"  # mixed case 'hello'
+    _test_decode("hex", input=mixed_case_hex2, output=b"hello")
+    upper_case_hex = b"68656C6C6F"  # uppercase 'hello'
+    _test_decode("hex", input=upper_case_hex, output=b"hello")
+
+    # Test with null values in different positions
+    df = daft.from_pydict({"v": [None, b"hello", None, b"\x01", None]})
+    result = df.select(col("v").encode("hex").alias("encoded"), col("v").try_encode("hex").alias("try_encoded"))
+    assert result.to_pydict()["encoded"][0] is None
+    assert result.to_pydict()["encoded"][2] is None
+    assert result.to_pydict()["encoded"][4] is None
+    assert result.to_pydict()["try_encoded"] == result.to_pydict()["encoded"]
+
+    # Test with empty hex string
+    empty_hex = b""
+    _test_decode("hex", input=empty_hex, output=b"")
+
+    # Test with special characters
+    special_chars = b"!@#$%^&*()"
+    special_chars_hex = binascii.hexlify(special_chars).upper()
+    _test_encode("hex", input=special_chars, output=special_chars_hex)
+    _test_decode("hex", input=special_chars_hex, output=special_chars)
+
+
+def test_codec_zstd():
+    with pytest.raises(Exception, match="unsupported codec"):
+        _test_codec("zstd", None)
+
+
+def test_codec_bz2():
+    with pytest.raises(Exception, match="unsupported codec"):
+        _test_codec("bz2", None)
+
+
+###
+# utf-8 special handling
+###
+
+
+def test_decode_utf8():
+    df = daft.from_pydict({"bytes": [None, TEXT]})
+    actual = df.select(col("bytes").decode("utf-8"))
+    expect = {"bytes": [None, TEXT.decode("utf-8")]}
+    assert actual.to_pydict() == expect
+
+
+def test_try_decode_utf8():
+    # source
+    # https://stackoverflow.com/questions/1301402/example-invalid-utf8-string
+    # https://www.php.net/manual/en/reference.pcre.pattern.modifiers.php#54805
+    valid_ascii = b"a"
+    valid_2_octet = b"\xc3\xb1"
+    invalid_2_octet = b"\xc3\x28"
+    invalid_seq_id = b"\xa0\xa1"
+    valid_3_octet = b"\xe2\x82\xa1"
+    invalid_3_octet_2nd = b"\xe2\x28\xa1"
+    invalid_3_octet_3rd = b"\xe2\x82\x28"
+    valid_4_octet = b"\xf0\x90\x8c\xbc"
+    invalid_4_octet_2nd = b"\xf0\x28\x8c\xbc"
+    invalid_4_octet_3rd = b"\xf0\x90\x28\xbc"
+    invalid_4_octet_4th = b"\xf0\x28\x8c\x28"
+    valid_5_octet = b"\xf8\xa1\xa1\xa1\xa1"
+    valid_6_octet = b"\xfc\xa1\xa1\xa1\xa1\xa1"
+
+    df = daft.from_pydict(
+        {
+            "bytes": [
+                None,
+                TEXT,
+                valid_ascii,
+                valid_2_octet,
+                invalid_2_octet,
+                invalid_seq_id,
+                valid_3_octet,
+                invalid_3_octet_2nd,
+                invalid_3_octet_3rd,
+                valid_4_octet,
+                invalid_4_octet_2nd,
+                invalid_4_octet_3rd,
+                invalid_4_octet_4th,
+                valid_5_octet,
+                valid_6_octet,
+            ],
+            "note": [
+                "None",
+                "Valid TEXT",
+                "Valid ASCII",
+                "Valid 2 Octet Sequence",
+                "Invalid 2 Octet Sequence",
+                "Invalid Sequence Identifier",
+                "Valid 3 Octet Sequence",
+                "Invalid 3 Octet Sequence (in 2nd Octet)",
+                "Invalid 3 Octet Sequence (in 3rd Octet)",
+                "Valid 4 Octet Sequence",
+                "Invalid 4 Octet Sequence (in 2nd Octet)",
+                "Invalid 4 Octet Sequence (in 3rd Octet)",
+                "Invalid 4 Octet Sequence (in 4th Octet)",
+                "Valid 5 Octet Sequence (but not Unicode!)",
+                "Valid 6 Octet Sequence (but not Unicode!)",
+            ],
+        }
+    )
+
+    result = df.select(col("bytes").try_decode("utf-8").alias("decoded"), col("note"))
+
+    expected = {
+        "decoded": [
+            None,
+            TEXT.decode("utf-8"),
+            str(valid_ascii, "utf-8"),
+            str(valid_2_octet, "utf-8"),
+            None,  # Invalid 2 Octet Sequence
+            None,  # Invalid Sequence Identifier
+            str(valid_3_octet, "utf-8"),
+            None,  # Invalid 3 Octet Sequence (in 2nd Octet)
+            None,  # Invalid 3 Octet Sequence (in 3rd Octet)
+            str(valid_4_octet, "utf-8"),
+            None,  # Invalid 4 Octet Sequence (in 2nd Octet)
+            None,  # Invalid 4 Octet Sequence (in 3rd Octet)
+            None,  # Invalid 4 Octet Sequence (in 4th Octet)
+            None,  # Valid 5 Octet Sequence (but not Unicode!)
+            None,  # Valid 6 Octet Sequence (but not Unicode!)
+        ],
+        "note": df.to_pydict()["note"],
+    }
+
+    assert result.to_pydict() == expected
+
+
+@pytest.mark.skip("sanity perf checking")
+def test_try_decode_utf8_perf():
+    from daft import DataType as dt
+
+    @daft.func.batch(return_dtype=dt.string())
+    def try_decode_utf8_udf(binary_series):
+        strings = []
+        for binary in binary_series:
+            try:
+                string = binary.decode("utf-8")
+                strings.append(string)
+            except UnicodeDecodeError:
+                strings.append(None)
+        return strings
+
+    # Create a large dataset with valid and invalid UTF-8 strings
+    n = 1_000_000
+    valid_data = [TEXT] * (n // 2)
+    invalid_data = [b"\xc3\x28"] * (n // 2)  # Invalid UTF-8 sequence
+    mixed_data = valid_data + invalid_data
+
+    df = daft.from_pydict({"bytes": mixed_data})
+
+    import statistics
+    import time
+
+    # run tests multiple times for statistical significance
+    udf_times = []
+    native_times = []
+    iterations = 11  # first one is warm-up
+
+    for i in range(iterations):
+        # test udf
+        start = time.time()
+        _ = df.select(try_decode_utf8_udf(col("bytes")).alias("decoded")).collect()
+        elapsed = time.time() - start
+        if i > 0:  # Skip the first iteration (warm-up)
+            udf_times.append(elapsed)
+        # test try_decode('utf-8')
+        start = time.time()
+        _ = df.select(col("bytes").try_decode("utf-8").alias("decoded")).collect()
+        elapsed = time.time() - start
+        if i > 0:  # Skip the first iteration (warm-up)
+            native_times.append(elapsed)
+
+    udf_time = sum(udf_times) / len(udf_times)
+    native_time = sum(native_times) / len(native_times)
+
+    # Statistical summary
+    udf_stats = {
+        "mean": udf_time,
+        "median": statistics.median(udf_times),
+        "min": min(udf_times),
+        "max": max(udf_times),
+        "stdev": statistics.stdev(udf_times) if len(udf_times) > 1 else 0,
+    }
+
+    native_stats = {
+        "mean": native_time,
+        "median": statistics.median(native_times),
+        "min": min(native_times),
+        "max": max(native_times),
+        "stdev": statistics.stdev(native_times) if len(native_times) > 1 else 0,
+    }
+
+    print(f"Native try_decode stats (seconds): {native_stats}")
+    print(f"UDF try_decode stats (seconds): {udf_stats}")
+    print(f"Average speedup: {udf_time / native_time:.2f}x")
+
+
+###
+# try_ tests
+###
+
+
+def test_try_encode():
+    pass
+
+
+def test_try_decode():
+    import gzip
+    import zlib
+
+    df = daft.from_pydict(
+        {
+            "bytes": [
+                None,
+                zlib.compress(TEXT),
+                gzip.compress(TEXT),
+                TEXT,
+            ]
+        }
+    )
+    actual = df.select(
+        col("bytes").try_decompress("zlib").alias("try_zlib"),
+        col("bytes").try_decompress("gzip").alias("try_gzip"),
+    )
+    expect = {
+        "try_zlib": [None, TEXT, None, None],
+        "try_gzip": [None, None, TEXT, None],
+    }
+    assert actual.to_pydict() == expect

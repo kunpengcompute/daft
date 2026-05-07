@@ -1,0 +1,73 @@
+[dependencies]
+async-recursion = "1.0.4"
+async-stream = {workspace = true}
+async-trait = {workspace = true}
+aws-config = "1.8.12"
+aws-credential-types = {version = "1.2.7", features = ["hardcoded-credentials"]}
+aws-sdk-s3 = {version = "1.119.0", features = ["default-https-client", "rt-tokio", "sigv4a"], default-features = false}
+aws-smithy-http-client = "1.1.2"
+aws-smithy-runtime-api = "1.8.0"
+azure_core = {git = "https://github.com/Eventual-Inc/azure-sdk-for-rust", tag = "patched-azure-identity-2", features = ["enable_reqwest_rustls", "hmac_rust"], default-features = false}
+azure_identity = {git = "https://github.com/Eventual-Inc/azure-sdk-for-rust", tag = "patched-azure-identity-2", features = ["enable_reqwest_rustls"], default-features = false}
+azure_storage = {git = "https://github.com/Eventual-Inc/azure-sdk-for-rust", tag = "patched-azure-identity-2", features = ["enable_reqwest_rustls"], default-features = false}
+azure_storage_blobs = {git = "https://github.com/Eventual-Inc/azure-sdk-for-rust", tag = "patched-azure-identity-2", features = ["enable_reqwest_rustls"], default-features = false}
+bytes = {workspace = true}
+common-error = {path = "../common/error", default-features = false}
+common-file-formats = {path = "../common/file-formats", default-features = false}
+common-io-config = {path = "../common/io-config", default-features = false}
+common-runtime = {path = "../common/runtime", default-features = false}
+futures = {workspace = true}
+globset = "0.4"
+google-cloud-storage = {version = "0.24.0", default-features = false, features = ["rustls-tls", "auth"]}
+google-cloud-token = {version = "0.1.2"}
+home = "0.5.12"
+itertools = {workspace = true}
+log = {workspace = true}
+opendal = {workspace = true, features = [
+  "executors-tokio",  # Use tokio for async execution
+  "services-oss",  # Alibaba Cloud Object Storage Service
+  "services-cos",  # Tencent Cloud Object Storage
+  "services-obs",  # Huawei Cloud Object Storage
+  "services-memory",  # In-memory backend (used for testing)
+  "services-fs",  # Local filesystem (used for integration testing)
+  "services-github"  # GitHub repository contents
+]}
+pyo3 = {workspace = true, optional = true}
+rand = {workspace = true}
+regex = {version = "1.12.2"}
+reqwest-middleware = "0.4.2"
+reqwest-retry = "0.7.0"
+serde = {workspace = true}
+snafu = {workspace = true}
+thiserror = {workspace = true}
+tokio = {workspace = true}
+tokio-stream = {workspace = true}
+tracing = {workspace = true}
+url = {workspace = true}
+uuid = {workspace = true}
+ve-tos-rust-sdk = "2.9.9"
+
+[dependencies.reqwest]
+default-features = false
+features = ["stream", "json"]
+version = "0.12.19"
+
+[dev-dependencies]
+md5 = "0.8.0"
+tempfile = "3.23.0"
+
+[features]
+python = [
+  "dep:pyo3",
+  "common-error/python",
+  "common-io-config/python",
+  "common-file-formats/python"
+]
+
+[lints]
+workspace = true
+
+[package]
+edition = {workspace = true}
+name = "daft-io"
+version = {workspace = true}

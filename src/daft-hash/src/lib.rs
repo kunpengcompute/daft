@@ -1,0 +1,113 @@
+use std::{
+    hash::{BuildHasher, Hasher},
+    str::FromStr,
+};
+
+use common_error::DaftError;
+use serde::{Deserialize, Serialize};
+use sha1::Digest;
+
+pub struct MurBuildHasher {
+    seed: u32,
+}
+
+impl Default for MurBuildHasher {
+    fn default() -> Self {
+        Self::new(42)
+    }
+}
+
+impl MurBuildHasher {
+    pub fn new(seed: u32) -> Self {
+        Self { seed }
+    }
+}
+
+impl BuildHasher for MurBuildHasher {
+    type Hasher = mur3::Hasher32;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        mur3::Hasher32::with_seed(self.seed)
+    }
+}
+
+#[derive(Default)]
+pub struct Sha1Hasher {
+    state: sha1::Sha1,
+}
+
+impl Hasher for Sha1Hasher {
+    fn finish(&self) -> u64 {
+        let result = self.state.clone().finalize();
+        let bytes: [u8; 8] = result[..8]
+            .try_into()
+            .expect("sha1 digest should be 20 bytes");
+        u64::from_le_bytes(bytes)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.state.update(bytes);
+    }
+}
+
+pub struct XxHash32Hasher {
+    inner: xxhash_rust::xxh32::Xxh32,
+}
+
+impl Hasher for XxHash32Hasher {
+    fn write(&mut self, bytes: &[u8]) {
+        self.inner.update(bytes);
+    }
+
+    fn finish(&self) -> u64 {
+        self.inner.digest() as u64
+    }
+}
+
+pub struct XxHash32BuildHasher {
+    seed: u32,
+}
+
+impl XxHash32BuildHasher {
+    pub fn new(seed: u32) -> Self {
+        Self { seed }
+    }
+}
+
+impl BuildHasher for XxHash32BuildHasher {
+    type Hasher = XxHash32Hasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        XxHash32Hasher {
+            inner: xxhash_rust::xxh32::Xxh32::new(self.seed),
+        }
+    }
+}
+
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum HashFunctionKind {
+    #[default]
+    MurmurHash3,
+    XxHash64,
+    XxHash32,
+    XxHash3_64,
+    Sha1,
+}
+
+impl FromStr for HashFunctionKind {
+    type Err = DaftError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "murmurhash3" => Ok(Self::MurmurHash3),
+            "xxhash64" => Ok(Self::XxHash64),
+            "xxhash32" => Ok(Self::XxHash32),
+            "xxhash3_64" | "xxhash" => Ok(Self::XxHash3_64),
+            "sha1" => Ok(Self::Sha1),
+            _ => Err(DaftError::ValueError(format!(
+                "Invalid hash function: {}",
+                s
+            ))),
+        }
+    }
+}

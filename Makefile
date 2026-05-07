@@ -1,0 +1,154 @@
+.DEFAULT_GOAL := help
+
+SHELL=/bin/bash
+VENV = .venv
+IS_M1 ?= 0
+PYTHON_VERSION ?= python3.11
+# Experimental cross-wheel build knobs for development use only (`make build-whl-cross`).
+# Avoid relying on these for production release workflows.
+BUILD_WHL_TARGET ?=
+BUILD_WHL_USE_ZIG ?= 1
+BUILD_WHL_COMPATIBILITY ?=
+BUILD_WHL_ZIG_FLAG = $(if $(filter 1 true yes,$(BUILD_WHL_USE_ZIG)),--zig,)
+BUILD_WHL_TARGET_FLAG = $(if $(strip $(BUILD_WHL_TARGET)),--target $(BUILD_WHL_TARGET),)
+BUILD_WHL_COMPATIBILITY_FLAG = $(if $(strip $(BUILD_WHL_COMPATIBILITY)),--compatibility $(BUILD_WHL_COMPATIBILITY),)
+BUILD_WHL_FD_LIMIT ?= 65536
+
+# Hypothesis
+HYPOTHESIS_MAX_EXAMPLES ?= 100
+HYPOTHESIS_SEED ?= 0
+
+# TPC-DS
+SCALE_FACTOR ?= 1
+OUTPUT_DIR ?= data/tpc-ds/
+
+
+ifeq ($(OS),Windows_NT)
+	VENV_BIN=$(VENV)/Scripts
+else
+	VENV_BIN=$(VENV)/bin
+endif
+
+
+.venv:  ## Set up virtual environment
+	@which uv > /dev/null || (echo "Error: uv is required but not installed. Please install uv first." && exit 1)
+	uv venv $(VENV) -p $(PYTHON_VERSION)
+ifeq ($(IS_M1), 1)
+	## Hacks to deal with grpcio compile errors on m1 macs
+	GRPC_PYTHON_BUILD_SYSTEM_OPENSSL=1 \
+	GRPC_PYTHON_BUILD_SYSTEM_ZLIB=1	\
+	CFLAGS="${CFLAGS} -I /opt/homebrew/opt/openssl/include"	\
+	LDFLAGS="${LDFLAGS} -L /opt/homebrew/opt/openssl/lib" \
+	uv sync --no-install-project --all-extras --all-groups
+else
+	uv sync --no-install-project --all-extras --all-groups
+endif
+
+.PHONY: check-toolchain
+check-toolchain:
+	@TOOLCHAIN="$(shell rustup show active-toolchain)"; \
+	if echo "$$TOOLCHAIN" | grep -q 'rust-toolchain.toml'; \
+	then \
+		echo "Toolchain is correct, continuing with build"; \
+	else \
+		echo "Failed to build: rust using incorrect toolchain: $$TOOLCHAIN"; \
+		exit 1; \
+	fi
+
+.PHONY: hooks
+hooks: .venv
+	source $(VENV_BIN)/activate && pre-commit install --install-hooks
+
+.PHONY: build
+build: check-toolchain .venv  ## Compile and install Daft for development
+	@unset CONDA_PREFIX && PYO3_PYTHON=$(VENV_BIN)/python $(VENV_BIN)/maturin develop --uv
+
+.PHONY: build-release
+build-release: check-toolchain .venv  ## Compile and install a faster Daft binary
+	@unset CONDA_PREFIX && PYO3_PYTHON=$(VENV_BIN)/python $(VENV_BIN)/maturin develop --release --uv
+
+.PHONY: build-whl
+build-whl: check-toolchain .venv  ## Compile Daft for development, only generate whl file without installation
+	@unset CONDA_PREFIX && PYO3_PYTHON=$(VENV_BIN)/python $(VENV_BIN)/maturin build --release
+
+# Experimental target for development-only cross-wheel builds.
+# Do not rely on this target for production release workflows.
+.PHONY: build-whl-cross
+build-whl-cross: check-toolchain .venv  ## Compile Daft wheel with optional --target/--zig flags
+	@SOFT_LIMIT=$$(ulimit -Sn); \
+	HARD_LIMIT=$$(ulimit -Hn); \
+	TARGET_LIMIT=$(BUILD_WHL_FD_LIMIT); \
+	if [ "$$HARD_LIMIT" = "unlimited" ] || [ "$$TARGET_LIMIT" -le "$$HARD_LIMIT" ]; then \
+		NEW_LIMIT=$$TARGET_LIMIT; \
+	else \
+		NEW_LIMIT=$$HARD_LIMIT; \
+	fi; \
+	if [ "$$SOFT_LIMIT" != "unlimited" ] && [ "$$SOFT_LIMIT" -lt "$$NEW_LIMIT" ]; then \
+		ulimit -Sn "$$NEW_LIMIT"; \
+		echo "Raised open files soft limit: $$SOFT_LIMIT -> $$NEW_LIMIT"; \
+	fi; \
+	if [ -n "$(BUILD_WHL_ZIG_FLAG)" ] && ! command -v zig > /dev/null 2>&1; then \
+		echo "Error: zig is required when BUILD_WHL_USE_ZIG=1 for build-whl-cross."; \
+		echo "Install: https://ziglang.org/download/"; \
+		echo "Or disable zig: make build-whl-cross BUILD_WHL_USE_ZIG=0"; \
+		exit 1; \
+	fi; \
+	unset CONDA_PREFIX && PYO3_PYTHON=$(VENV_BIN)/python $(VENV_BIN)/maturin build --release $(BUILD_WHL_COMPATIBILITY_FLAG) $(BUILD_WHL_TARGET_FLAG) $(BUILD_WHL_ZIG_FLAG)
+
+.PHONY: test
+test: .venv build  ## Run tests
+	# You can set additional run parameters through EXTRA_ARGS, such as running a specific test case file or method:
+	# make test EXTRA_ARGS="-v tests/dataframe/test_select.py" # Run a single test file
+	# make test EXTRA_ARGS="-v tests/dataframe/test_select.py::test_select_dataframe" # Run a single test method
+	HYPOTHESIS_MAX_EXAMPLES=$(HYPOTHESIS_MAX_EXAMPLES) $(VENV_BIN)/pytest -n auto --hypothesis-seed=$(HYPOTHESIS_SEED) --ignore tests/integration $(EXTRA_ARGS)
+
+.PHONY: doctests
+doctests: .venv
+	DAFT_BOLD_TABLE_HEADERS=0 DAFT_PROGRESS_BAR=0 $(VENV_BIN)/pytest --doctest-modules --continue-on-collection-errors --ignore=daft/functions/llm.py --ignore=daft/functions/ai/__init__.py daft/dataframe/dataframe.py daft/expressions/expressions.py daft/convert.py daft/udf/__init__.py daft/functions/ daft/datatype.py
+
+.PHONY: dsdgen
+dsdgen: .venv ## Generate TPC-DS data
+	$(VENV_BIN)/python benchmarking/tpcds/datagen.py --scale-factor=$(SCALE_FACTOR) --tpcds-gen-folder=$(OUTPUT_DIR)
+
+.PHONY: install-docs-deps
+install-docs-deps:
+	source $(VENV_BIN)/activate && uv sync --all-extras --all-groups
+	source $(VENV_BIN)/activate && uv pip install -e docs/plugins/nav_hide_children
+
+.PHONY: docs
+docs: .venv install-docs-deps ## Build Daft documentation
+	JUPYTER_PLATFORM_DIRS=1 uv run mkdocs build -f mkdocs.yml
+
+.PHONY: docs-serve
+docs-serve: .venv install-docs-deps ## Build Daft documentation in development server
+	JUPYTER_PLATFORM_DIRS=1 uv run mkdocs serve -f mkdocs.yml
+
+
+.PHONY: check-format
+check-format: check-toolchain .venv  ## Check if code is properly formatted
+	source $(VENV_BIN)/activate && pre-commit run --all-files
+
+.PHONY: format-check
+format-check: check-format  ## Alias for check-format
+
+format: check-toolchain .venv  ## Format Python and Rust code
+	source $(VENV_BIN)/activate && pre-commit run ruff-format --all-files
+	source $(VENV_BIN)/activate && pre-commit run fmt --all-files
+
+.PHONY: lint
+lint: check-toolchain .venv  ## Lint Python and Rust code
+	source $(VENV_BIN)/activate && pre-commit run ruff-check --all-files
+	source $(VENV_BIN)/activate && pre-commit run clippy --all-files
+
+.PHONY: precommit
+precommit: check-toolchain .venv  ## Run all pre-commit hooks
+	source $(VENV_BIN)/activate && pre-commit run --all-files --hook-stage pre-commit --hook-stage manual
+
+.PHONY: clean
+clean:
+ifneq ($(SKIP_VENV),true)
+	rm -rf $(VENV)
+endif
+	rm -rf ./target
+	rm -rf ./site
+	rm -f daft/daft.abi3.so

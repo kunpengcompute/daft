@@ -1,0 +1,76 @@
+# Added by jetbrains IDE
+.idea/
+
+.coverage
+.env
+venv
+.venv
+dist
+**/__pycache__/
+requirements.txt
+build
+.cython_build
+.hypothesis
+
+**/.ipynb_checkpoints/
+
+**/node_modules/**
+data/**
+benchmarking/tpcds/data
+*.so
+*.dylib
+*.whl
+log/
+*.egg-info
+
+# Added by MacOS
+**.DS_Store
+
+# Added by cargo
+/target
+**/target/
+# pytest benchmarks
+.benchmarks
+
+# Added by pyenv
+.python-version
+
+# Added by mypy
+.mypy_cache
+
+# Zed editor
+.zed/
+
+# helix editor
+.helix
+
+# dependencies
+node_modules
+
+# next.js
+.next
+
+out/**
+!out/
+!out/.gitkeep
+
+# production
+/build
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# docs build
+site
+
+# added by vim
+*.swp
+*.swo
+
+# AGENT Prompting Templates
+AGENTS.md
+CLAUDE.local.md
+.claude/**/*.md
+.claude/worktrees/
+.beads

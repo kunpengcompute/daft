@@ -1,0 +1,12 @@
+[dependencies]
+arrow = {workspace = true, features = ["ffi"]}
+arrow-schema = {workspace = true}
+pyo3 = {workspace = true}
+
+[lints]
+workspace = true
+
+[package]
+edition = {workspace = true}
+name = "common-arrow-ffi"
+version = {workspace = true}

@@ -1,0 +1,16 @@
+{
+  "rust-analyzer.check.extraEnv": {
+    "CARGO_TARGET_DIR": "target/analyzer"
+  },
+  "rust-analyzer.check.features": "all",
+  "rust-analyzer.cargo.features": "all",
+  "python.testing.pytestArgs": [
+    "tests"
+  ],
+  "git.branchProtection": [
+    "main"
+  ],
+  "python.testing.unittestEnabled": false,
+  "python.testing.pytestEnabled": true,
+  "makefile.configureOnOpen": false
+}

@@ -1,0 +1,67 @@
+services:
+
+  # MinIO is an S3-compatible API object store
+  # Test fixtures should populate data in MinIO directly using S3 APIs such as boto3 or s3fs
+  minio:
+    image: quay.io/minio/minio
+    volumes:
+    - /data
+    ports:
+    - 9000:9000
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command:
+    - server
+    - /data
+
+  # Use nginx to serve static files
+  # Test fixtures should dump data in the `/tmp/daft-integration-testing/nginx` folder
+  nginx:
+    build:
+      context: .
+      dockerfile: Dockerfile.nginx
+    volumes:
+    - /tmp/daft-integration-testing/nginx:/app/static:rw
+    ports:
+    - 8080:8080
+
+  # Custom FastAPI server which mocks an s3 endpoint and serves retryable objects
+  s3-retry-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.s3_retry_server
+    ports:
+    - 8001:8000
+
+  # Bigtable emulator for integration testing
+  bigtable-emulator:
+    image: google/cloud-sdk
+    container_name: bigtable-emulator
+    ports:
+    - "127.0.0.1:8086:8086"
+    command: gcloud beta emulators bigtable start --host-port=0.0.0.0:8086
+    environment:
+    - BIGTABLE_EMULATOR_HOST=0.0.0.0:8086
+
+  redpanda:
+    image: redpandadata/redpanda:v25.1.3
+    ports:
+    - "9092:9092"
+    command:
+    - redpanda
+    - start
+    - --overprovisioned
+    - --smp
+    - "1"
+    - --memory
+    - "1G"
+    - --reserve-memory
+    - "0M"
+    - --node-id
+    - "0"
+    - --check=false
+    - --kafka-addr
+    - PLAINTEXT://0.0.0.0:9092
+    - --advertise-kafka-addr
+    - PLAINTEXT://127.0.0.1:9092
