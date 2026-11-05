@@ -1,4 +1,7 @@
-use std::hash::{BuildHasher, Hasher};
+use std::{
+    hash::{BuildHasher, Hasher},
+    ptr,
+};
 
 use daft_arrow::{
     array::{
@@ -14,36 +17,184 @@ use xxhash_rust::{
     const_xxh3, const_xxh32, const_xxh64, xxh3::xxh3_64_with_seed, xxh32::xxh32, xxh64::xxh64,
 };
 
+// XXH3 constants for the len == 8 short-input path.
+const XXH3_PRIME_MX2: u64 = 0x9FB2_1C65_1E98_DF25;
+// SECRET[8..16] ^ SECRET[16..24] of the default XXH3 secret.
+const XXH3_BITFLIP_LEN8_BASE: u64 = 0xC73A_B174_C5EC_D5A2;
+
+/// Specialized XXH3 (64-bit) hash for an exactly 8-byte input.
+///
+/// On little-endian targets this is bit-identical to
+/// `xxh3_64_with_seed(&v.to_le_bytes(), seed)`, but avoids the generic
+/// `&[u8]` dispatch.
+#[inline(always)]
+fn xxh3_64_8b(v: u64, seed: u64) -> u64 {
+    // Short-input seed transformation: seed' = seed XOR (bswap32(seed_lo32) << 32)
+    let seed_mix = seed ^ (((seed as u32).swap_bytes() as u64) << 32);
+    let bitflip = XXH3_BITFLIP_LEN8_BASE.wrapping_sub(seed_mix);
+    let keyed = v.rotate_left(32) ^ bitflip;
+    let mut h = keyed ^ keyed.rotate_left(49) ^ keyed.rotate_left(24);
+    h = h.wrapping_mul(XXH3_PRIME_MX2);
+    h ^= (h >> 35).wrapping_add(8);
+    h = h.wrapping_mul(XXH3_PRIME_MX2);
+    h ^ (h >> 28)
+}
+
+/// Hash `len` values stored as contiguous 8-byte words.
+///
+/// # Safety
+///
+/// `src` must be 8-byte aligned and valid for `len` reads, `dst` must be valid
+/// for `len` writes, and the two ranges must not overlap.
+#[inline]
+unsafe fn xxh3_64_8b_dense(src: *const u64, dst: *mut u64, len: usize) {
+    const UNROLL: usize = 8;
+    let chunks = len / UNROLL;
+    let tail_start = chunks * UNROLL;
+
+    // SAFETY: the caller guarantees `src`/`dst` validity and non-overlap; all
+    // indices below are within `0..len`, so every read/write is in bounds.
+    unsafe {
+        for i in 0..chunks {
+            let b = i * UNROLL;
+
+            #[cfg(target_arch = "aarch64")]
+            std::arch::asm!(
+                "prfm pldl1keep, [{p}, #256]",
+                p = in(reg) src.add(b),
+                options(nostack, preserves_flags, readonly),
+            );
+
+            let v0 = ptr::read(src.add(b));
+            let v1 = ptr::read(src.add(b + 1));
+            let v2 = ptr::read(src.add(b + 2));
+            let v3 = ptr::read(src.add(b + 3));
+            let v4 = ptr::read(src.add(b + 4));
+            let v5 = ptr::read(src.add(b + 5));
+            let v6 = ptr::read(src.add(b + 6));
+            let v7 = ptr::read(src.add(b + 7));
+
+            let h0 = xxh3_64_8b(v0, 0);
+            let h1 = xxh3_64_8b(v1, 0);
+            let h2 = xxh3_64_8b(v2, 0);
+            let h3 = xxh3_64_8b(v3, 0);
+            let h4 = xxh3_64_8b(v4, 0);
+            let h5 = xxh3_64_8b(v5, 0);
+            let h6 = xxh3_64_8b(v6, 0);
+            let h7 = xxh3_64_8b(v7, 0);
+
+            ptr::write(dst.add(b), h0);
+            ptr::write(dst.add(b + 1), h1);
+            ptr::write(dst.add(b + 2), h2);
+            ptr::write(dst.add(b + 3), h3);
+            ptr::write(dst.add(b + 4), h4);
+            ptr::write(dst.add(b + 5), h5);
+            ptr::write(dst.add(b + 6), h6);
+            ptr::write(dst.add(b + 7), h7);
+        }
+
+        for i in tail_start..len {
+            let v = ptr::read(src.add(i));
+            ptr::write(dst.add(i), xxh3_64_8b(v, 0));
+        }
+    }
+}
+
+/// Vectorized hash loop over a primitive array.
+///
+/// Reads the array's values through a raw pointer and writes the hashes into
+/// `dst`. The no-null, unseeded case is unrolled 4x; nulls hash to `null_hash`
+/// and seeded rows use the corresponding per-row seed value, matching the
+/// scalar baseline.
+///
+/// # Safety
+///
+/// `dst` must be valid for writes of `array.len()` `u64` values and must not
+/// overlap the array's value buffer. A `seed` array passed here must have the
+/// same length as `array` (enforced by [`hash`]).
+#[inline]
+unsafe fn xxh_loop<T, F>(
+    array: &PrimitiveArray<T>,
+    seed: Option<&PrimitiveArray<u64>>,
+    dst: *mut u64,
+    null_hash: u64,
+    f: F,
+) where
+    T: NativeType,
+    F: Fn(&[u8], u64) -> u64,
+{
+    let len = array.len();
+    let values = array.values().as_slice().as_ptr();
+
+    // SAFETY: `values` is valid for `len` reads and `dst` for `len` writes;
+    // every index used below is in `0..len`, and `s` (when present) has
+    // `len` elements.
+    unsafe {
+        match (array.null_count() == 0, seed) {
+            (true, None) => {
+                let chunks = len / 4;
+                let tail_start = chunks * 4;
+                for i in 0..chunks {
+                    let b = i * 4;
+                    let v0 = ptr::read(values.add(b));
+                    let v1 = ptr::read(values.add(b + 1));
+                    let v2 = ptr::read(values.add(b + 2));
+                    let v3 = ptr::read(values.add(b + 3));
+                    let h0 = f(v0.to_le_bytes().as_ref(), 0);
+                    let h1 = f(v1.to_le_bytes().as_ref(), 0);
+                    let h2 = f(v2.to_le_bytes().as_ref(), 0);
+                    let h3 = f(v3.to_le_bytes().as_ref(), 0);
+                    ptr::write(dst.add(b), h0);
+                    ptr::write(dst.add(b + 1), h1);
+                    ptr::write(dst.add(b + 2), h2);
+                    ptr::write(dst.add(b + 3), h3);
+                }
+                for i in tail_start..len {
+                    let v = ptr::read(values.add(i));
+                    ptr::write(dst.add(i), f(v.to_le_bytes().as_ref(), 0));
+                }
+            }
+            (true, Some(seeds)) => {
+                let s = seeds.values().as_slice().as_ptr();
+                for i in 0..len {
+                    let v = ptr::read(values.add(i));
+                    let sd = *s.add(i);
+                    ptr::write(dst.add(i), f(v.to_le_bytes().as_ref(), sd));
+                }
+            }
+            (false, None) => {
+                for i in 0..len {
+                    let h = if array.is_valid(i) {
+                        let v = ptr::read(values.add(i));
+                        f(v.to_le_bytes().as_ref(), 0)
+                    } else {
+                        null_hash
+                    };
+                    ptr::write(dst.add(i), h);
+                }
+            }
+            (false, Some(seeds)) => {
+                let s = seeds.values().as_slice().as_ptr();
+                for i in 0..len {
+                    let h = if array.is_valid(i) {
+                        let v = ptr::read(values.add(i));
+                        f(v.to_le_bytes().as_ref(), *s.add(i))
+                    } else {
+                        null_hash
+                    };
+                    ptr::write(dst.add(i), h);
+                }
+            }
+        }
+    }
+}
+
 fn hash_primitive<T: NativeType>(
     array: &PrimitiveArray<T>,
     seed: Option<&PrimitiveArray<u64>>,
     hash_function: HashFunctionKind,
 ) -> PrimitiveArray<u64> {
-    fn xxhash<const NULL_HASH: u64, T: NativeType, F: Fn(&[u8], u64) -> u64>(
-        array: &PrimitiveArray<T>,
-        seed: Option<&PrimitiveArray<u64>>,
-        f: F,
-    ) -> PrimitiveArray<u64> {
-        let hashes = if let Some(seed) = seed {
-            array
-                .iter()
-                .zip(seed.values_iter())
-                .map(|(v, s)| match v {
-                    Some(v) => f(v.to_le_bytes().as_ref(), *s),
-                    None => NULL_HASH,
-                })
-                .collect::<Vec<_>>()
-        } else {
-            array
-                .iter()
-                .map(|v| match v {
-                    Some(v) => f(v.to_le_bytes().as_ref(), 0),
-                    None => NULL_HASH,
-                })
-                .collect::<Vec<_>>()
-        };
-        PrimitiveArray::<u64>::new(DataType::UInt64, hashes.into(), None)
-    }
+    let len = array.len();
 
     match hash_function {
         HashFunctionKind::MurmurHash3 => {
@@ -87,15 +238,51 @@ fn hash_primitive<T: NativeType>(
         }
         HashFunctionKind::XxHash32 => {
             const NULL_HASH: u64 = const_xxh32::xxh32(b"", 0) as u64;
-            xxhash::<NULL_HASH, _, _>(array, seed, |v, s| xxh32(v, s as u32) as u64)
+            let mut hashes = vec![0u64; len];
+            // SAFETY: `hashes` has `len` elements, matching `array`, and its
+            // buffer cannot alias the array's immutable value buffer.
+            unsafe {
+                xxh_loop(array, seed, hashes.as_mut_ptr(), NULL_HASH, |b, s| {
+                    xxh32(b, s as u32) as u64
+                });
+            }
+            PrimitiveArray::<u64>::new(DataType::UInt64, hashes.into(), None)
         }
         HashFunctionKind::XxHash64 => {
             const NULL_HASH: u64 = const_xxh64::xxh64(b"", 0);
-            xxhash::<NULL_HASH, _, _>(array, seed, xxh64)
+            let mut hashes = vec![0u64; len];
+            // SAFETY: `hashes` has `len` elements, matching `array`, and its
+            // buffer cannot alias the array's immutable value buffer.
+            unsafe {
+                xxh_loop(array, seed, hashes.as_mut_ptr(), NULL_HASH, xxh64);
+            }
+            PrimitiveArray::<u64>::new(DataType::UInt64, hashes.into(), None)
         }
         HashFunctionKind::XxHash3_64 => {
             const NULL_HASH: u64 = const_xxh3::xxh3_64(b"");
-            xxhash::<NULL_HASH, _, _>(array, seed, xxh3_64_with_seed)
+            let mut hashes = vec![0u64; len];
+            let dst = hashes.as_mut_ptr();
+            let values = array.values().as_slice().as_ptr();
+            // The dense 8-byte path requires: no nulls, no seed, 8-byte values,
+            // and an 8-byte aligned value buffer (raw `u64` reads).
+            if std::mem::size_of::<T>() == 8
+                && array.null_count() == 0
+                && seed.is_none()
+                && (values as usize) % std::mem::align_of::<u64>() == 0
+            {
+                // SAFETY: `values` is valid for `len` reads of 8-byte values,
+                // `dst` is valid for `len` writes, and the two allocations are
+                // distinct. Alignment was checked above.
+                unsafe {
+                    xxh3_64_8b_dense(values as *const u64, dst, len);
+                }
+            } else {
+                // SAFETY: `hashes` has `len` elements, matching `array`.
+                unsafe {
+                    xxh_loop(array, seed, dst, NULL_HASH, xxh3_64_with_seed);
+                }
+            }
+            PrimitiveArray::<u64>::new(DataType::UInt64, hashes.into(), None)
         }
     }
 }
@@ -825,4 +1012,66 @@ pub fn hash(
             )));
         }
     })
+}
+
+#[cfg(test)]
+mod port_tests {
+    use super::*;
+
+    /// Deterministic 64-bit LCG (Numerical Recipes constants); no `rand` dependency.
+    fn lcg_values(len: usize) -> Vec<i64> {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                state as i64
+            })
+            .collect()
+    }
+
+    #[test]
+    fn xxh3_64_dense_matches_reference() {
+        let values = lcg_values(1000);
+        let array = PrimitiveArray::<i64>::from_vec(values.clone());
+        let hashed = hash_primitive(&array, None, HashFunctionKind::XxHash3_64);
+
+        assert_eq!(hashed.len(), values.len());
+        assert_eq!(hashed.null_count(), 0);
+        for (i, v) in values.iter().enumerate() {
+            assert_eq!(
+                hashed.value(i),
+                const_xxh3::xxh3_64(&v.to_le_bytes()),
+                "hash mismatch at index {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn xxh3_64_with_nulls_matches_reference() {
+        const NULL_HASH: u64 = const_xxh3::xxh3_64(b"");
+
+        let values = lcg_values(1000);
+        // Null out every 97th element (11 nulls), forcing the null-aware path.
+        let optional: Vec<Option<i64>> = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| if i % 97 == 0 { None } else { Some(*v) })
+            .collect();
+        let array = PrimitiveArray::<i64>::from(optional);
+
+        assert!(array.null_count() > 0);
+        let hashed = hash_primitive(&array, None, HashFunctionKind::XxHash3_64);
+        assert_eq!(hashed.len(), values.len());
+
+        for (i, v) in values.iter().enumerate() {
+            let expected = if i % 97 == 0 {
+                NULL_HASH
+            } else {
+                const_xxh3::xxh3_64(&v.to_le_bytes())
+            };
+            assert_eq!(hashed.value(i), expected, "hash mismatch at index {i}");
+        }
+    }
 }

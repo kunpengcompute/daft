@@ -15,9 +15,35 @@ use hashbrown::{HashMap, hash_map::RawEntryMut};
 use super::{ArrowTableEntry, IndicesMapper, Probeable, ProbeableBuilder};
 use crate::RecordBatch;
 
+/// Inline storage for a key's matching build-row indices. The common case in a
+/// join build is a unique key -> exactly one index, which `One` keeps inline (no
+/// heap allocation); only keys with multiple matches spill to a Vec. This removes
+/// millions of single-element Vec allocations on large builds.
+enum Indices {
+    One(u64),
+    Many(Vec<u64>),
+}
+
+impl Indices {
+    #[inline]
+    fn as_slice(&self) -> &[u64] {
+        match self {
+            Indices::One(x) => std::slice::from_ref(x),
+            Indices::Many(v) => v.as_slice(),
+        }
+    }
+    #[inline]
+    fn push(&mut self, idx: u64) {
+        match self {
+            Indices::One(x) => *self = Indices::Many(vec![*x, idx]),
+            Indices::Many(v) => v.push(idx),
+        }
+    }
+}
+
 pub struct ProbeTable {
     schema: SchemaRef,
-    hash_table: HashMap<IndexHash, Vec<u64>, IdentityBuildHasher>,
+    hash_table: HashMap<IndexHash, Indices, IdentityBuildHasher>,
     tables: Vec<ArrowTableEntry>,
     compare_fn: MultiDynArrayComparator,
     num_groups: usize,
@@ -33,7 +59,7 @@ impl ProbeTable {
 
     pub(crate) fn new(schema: SchemaRef, null_equal_aware: Option<&Vec<bool>>) -> DaftResult<Self> {
         let hash_table =
-            HashMap::<IndexHash, Vec<u64>, IdentityBuildHasher>::with_capacity_and_hasher(
+            HashMap::<IndexHash, Indices, IdentityBuildHasher>::with_capacity_and_hasher(
                 Self::DEFAULT_SIZE,
                 Default::default(),
             );
@@ -124,6 +150,11 @@ impl ProbeTable {
             .collect::<DaftResult<Vec<_>>>()?;
         self.tables.push(ArrowTableEntry(current_arrays));
         let current_array_refs = self.tables.last().unwrap().0.as_slice();
+
+        // Pre-size the probe table to the rows we're about to insert.
+        #[cfg(target_arch = "aarch64")]
+        self.hash_table.reserve(table.len());
+
         for (i, h) in hashes.as_arrow2().values_iter().enumerate() {
             let idx = table_offset | i;
             let entry = self.hash_table.raw_entry_mut().from_hash(*h, |other| {
@@ -152,7 +183,7 @@ impl ProbeTable {
                             idx: idx as u64,
                             hash: *h,
                         },
-                        vec![idx as u64],
+                        Indices::One(idx as u64),
                     );
                     self.num_groups += 1;
                 }
@@ -182,6 +213,112 @@ impl Probeable for ProbeTable {
     ) -> DaftResult<Box<dyn Iterator<Item = bool> + 'a>> {
         let iter = self.probe(table)?;
         Ok(Box::new(iter.map(|indices| indices.is_some())))
+    }
+
+    fn probe_indices_vec(&self, input: &RecordBatch) -> DaftResult<Vec<(u32, u64, u64)>> {
+        assert_eq!(self.schema.len(), input.schema.len());
+        assert!(
+            self.schema
+                .into_iter()
+                .zip(input.schema.fields())
+                .all(|(l, r)| l.dtype == r.dtype)
+        );
+
+        let hashes = input.hash_rows()?;
+
+        #[allow(deprecated, reason = "arrow2 migration")]
+        let input_arrays = input
+            .columns
+            .iter()
+            .map(|s| Ok(s.as_physical()?.to_arrow2()))
+            .collect::<DaftResult<Vec<_>>>()?;
+
+        let mut results = Vec::with_capacity(input.len());
+
+        for (probe_row_idx, h) in hashes.as_arrow2().clone().into_iter().enumerate() {
+            if let Some(h) = h {
+                if let Some((_, indices)) = self.hash_table.raw_entry().from_hash(h, |other| {
+                    h == other.hash && {
+                        let table_idx = (other.idx >> Self::TABLE_IDX_SHIFT) as usize;
+                        let row_idx = (other.idx & Self::LOWER_MASK) as usize;
+                        let other_table = self.tables.get(table_idx).unwrap();
+                        (self.compare_fn)(
+                            other_table.0.as_slice(),
+                            &input_arrays,
+                            row_idx,
+                            probe_row_idx,
+                        )
+                        .is_eq()
+                    }
+                }) {
+                    for &encoded in indices.as_slice() {
+                        let table_idx = encoded >> Self::TABLE_IDX_SHIFT;
+                        let row_idx = encoded & Self::LOWER_MASK;
+                        results.push((probe_row_idx as u32, table_idx, row_idx));
+                    }
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    fn probe_indices_vec_none(
+        &self,
+        input: &RecordBatch,
+    ) -> DaftResult<Vec<(u32, Option<(u64, u64)>)>> {
+        assert_eq!(self.schema.len(), input.schema.len());
+        assert!(
+            self.schema
+                .into_iter()
+                .zip(input.schema.fields())
+                .all(|(l, r)| l.dtype == r.dtype)
+        );
+
+        let hashes = input.hash_rows()?;
+
+        #[allow(deprecated, reason = "arrow2 migration")]
+        let input_arrays = input
+            .columns
+            .iter()
+            .map(|s| Ok(s.as_physical()?.to_arrow2()))
+            .collect::<DaftResult<Vec<_>>>()?;
+
+        let mut results = Vec::with_capacity(input.len());
+
+        for (probe_row_idx, h) in hashes.as_arrow2().clone().into_iter().enumerate() {
+            let mut found = false;
+
+            if let Some(h) = h {
+                if let Some((_, indices)) = self.hash_table.raw_entry().from_hash(h, |other| {
+                    h == other.hash && {
+                        let table_idx = (other.idx >> Self::TABLE_IDX_SHIFT) as usize;
+                        let row_idx = (other.idx & Self::LOWER_MASK) as usize;
+                        let other_table = self.tables.get(table_idx).unwrap();
+                        (self.compare_fn)(
+                            other_table.0.as_slice(),
+                            &input_arrays,
+                            row_idx,
+                            probe_row_idx,
+                        )
+                        .is_eq()
+                    }
+                }) {
+                    for &encoded in indices.as_slice() {
+                        let table_idx = encoded >> Self::TABLE_IDX_SHIFT;
+                        let row_idx = encoded & Self::LOWER_MASK;
+                        results.push((probe_row_idx as u32, Some((table_idx, row_idx))));
+                    }
+                    found = true;
+                }
+            }
+
+            if !found {
+                results.push((probe_row_idx as u32, None));
+            }
+        }
+
+        Ok(results)
     }
 }
 

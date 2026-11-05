@@ -375,11 +375,11 @@ impl OuterHashJoinProbeSink {
                 let mut probe_side_idxs = Vec::with_capacity(input_table.len());
 
                 let join_keys = input_table.eval_expression_list(probe_on)?;
-                let idx_iter = probe_state.probe_indices(&join_keys)?;
+                let matches = probe_state.probe_indices_vec_none(&join_keys)?;
 
-                for (probe_row_idx, inner_iter) in idx_iter.enumerate() {
-                    if let Some(inner_iter) = inner_iter {
-                        for (build_table_idx, build_row_idx) in inner_iter {
+                for (probe_idx, match_opt) in matches {
+                    match match_opt {
+                        Some((build_table_idx, build_row_idx)) => {
                             bitmap_builder
                                 .mark_used(build_table_idx as usize, build_row_idx as usize);
                             build_side_growable.extend(
@@ -387,12 +387,13 @@ impl OuterHashJoinProbeSink {
                                 build_row_idx as usize,
                                 1,
                             );
-                            probe_side_idxs.push(probe_row_idx as u64);
+                            probe_side_idxs.push(probe_idx as u64);
                         }
-                    } else {
-                        // if there's no match, we should still emit the probe side and fill the build side with nulls
-                        build_side_growable.add_nulls(1);
-                        probe_side_idxs.push(probe_row_idx as u64);
+                        None => {
+                            // if there's no match, we should still emit the probe side and fill the build side with nulls
+                            build_side_growable.add_nulls(1);
+                            probe_side_idxs.push(probe_idx as u64);
+                        }
                     }
                 }
 
