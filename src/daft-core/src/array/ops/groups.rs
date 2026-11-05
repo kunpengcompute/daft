@@ -35,6 +35,7 @@ use crate::{
 /// ```
 ///
 /// Calling `make_groups` on the above list would return `(vec![0, 1, 3], vec![vec![0, 2, 4], vec![1], vec![3]])` since `a` appeared 3 times at indices `0`, `2`, and `4`, etc.
+#[cfg(not(target_arch = "aarch64"))]
 fn make_groups<T>(iter: impl Iterator<Item = T>) -> DaftResult<super::GroupIndicesPair>
 where
     T: Hash,
@@ -66,6 +67,92 @@ where
     }
 
     Ok((sample_indices, group_indices))
+}
+
+#[cfg(target_arch = "aarch64")]
+fn make_groups<T>(iter: impl Iterator<Item = T>) -> DaftResult<super::GroupIndicesPair>
+where
+    T: Hash,
+    T: Eq,
+{
+    const MIN_CAP: usize = 256;
+    const CACHE_LINE_SIZE: usize = 128;
+    let (lo, hi) = iter.size_hint();
+    let n_est = hi.unwrap_or(lo);
+
+    if n_est == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let mut sample_map = FnvHashMap::<T, usize>::with_capacity_and_hasher(
+        n_est.min(MIN_CAP),
+        BuildHasherDefault::default(),
+    );
+
+    // ARM优化：优化数据布局，提高CacheLine有效性和Cache命中率
+    let mut groups = Vec::with_capacity(n_est.min(MIN_CAP));
+    let mut idx_u64: u64 = 0;
+    let mut groups_index = 0;
+    let mut iter = iter;
+
+    // ARM优化：使用数组分批处理，提高缓存命中率
+    let mut buffer = Vec::with_capacity(CACHE_LINE_SIZE);
+    let groups_num = n_est >> 7; // 除以CACHE_LINE_SIZE
+
+    for _ in 0..groups_num {
+        for _ in 0..CACHE_LINE_SIZE {
+            match iter.next() {
+                None => break,
+                Some(val) => {
+                    buffer.push((idx_u64, val));
+                    idx_u64 += 1;
+                }
+            }
+        }
+        // ARM优化：顺序访问模式，提高缓存效率
+        for (idx, val) in buffer {
+            match sample_map.entry(val) {
+                Vacant(e) => {
+                    e.insert(groups_index);
+                    let mut v = Vec::with_capacity(4); // ARM友好的初始容量
+                    v.push(idx);
+                    groups.push(v);
+                    groups_index += 1;
+                }
+                Occupied(e) => {
+                    let group_idx = *e.get();
+                    groups[group_idx].push(idx);
+                }
+            }
+        }
+        buffer = Vec::with_capacity(CACHE_LINE_SIZE);
+        sample_map.reserve(CACHE_LINE_SIZE);
+    }
+    // 处理剩余元素
+    for val in iter {
+        match sample_map.entry(val) {
+            Vacant(e) => {
+                e.insert(groups_index);
+                let mut v = Vec::with_capacity(4); // ARM友好的初始容量
+                v.push(idx_u64);
+                groups.push(v);
+                groups_index += 1;
+            }
+            Occupied(e) => {
+                let group_idx = *e.get();
+                groups[group_idx].push(idx_u64);
+            }
+        }
+        idx_u64 += 1;
+    }
+    // 构建结果
+    let mut sample_indices = Vec::with_capacity(groups_index);
+
+    for group_index in groups.iter() {
+        sample_indices.push(group_index[0]);
+    }
+
+    Ok((sample_indices, groups))
 }
 
 fn make_unique_idxs<T>(iter: impl Iterator<Item = T>) -> DaftResult<super::VecIndices>

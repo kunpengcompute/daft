@@ -135,6 +135,7 @@ ignored = ["lzma-sys"]
 arrow2 = {path = "src/arrow2"}
 parquet-format-safe = {path = "src/parquet-format-safe"}
 parquet2 = {path = "src/parquet2"}
+snap = { git = "https://gitcode.com/xuanwu/snap.git", branch = "kunpeng-dev" }
 
 [profile.bench]
 debug = true

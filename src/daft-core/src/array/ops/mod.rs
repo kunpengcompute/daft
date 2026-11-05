@@ -1,3 +1,5 @@
+#[cfg(target_arch = "aarch64")]
+pub(crate) mod aarch64;
 mod abs;
 mod apply;
 mod approx_count_distinct;

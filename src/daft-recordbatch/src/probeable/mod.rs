@@ -78,6 +78,41 @@ pub trait Probeable: Send + Sync {
     /// NOTE: This function only works if track_indices is true.
     fn probe_indices<'a>(&'a self, table: &'a RecordBatch) -> DaftResult<IndicesMapper<'a>>;
 
+    fn probe_indices_vec(&self, table: &RecordBatch) -> DaftResult<Vec<(u32, u64, u64)>> {
+        let iter = self.probe_indices(table)?.make_iter();
+
+        let mut results = Vec::new();
+
+        for (probe_idx, inner) in iter.enumerate() {
+            if let Some(inner) = inner {
+                for (rb_idx, row_idx) in inner {
+                    results.push((probe_idx as u32, rb_idx as u64, row_idx));
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    fn probe_indices_vec_none(
+        &self,
+        table: &RecordBatch,
+    ) -> DaftResult<Vec<(u32, Option<(u64, u64)>)>> {
+        let iter = self.probe_indices(table)?.make_iter();
+
+        let mut results = Vec::new();
+
+        for (probe_idx, inner) in iter.enumerate() {
+            if let Some(inner) = inner {
+                for (rb_idx, row_idx) in inner {
+                    results.push((probe_idx as u32, Some((rb_idx as u64, row_idx))));
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Probe_exists returns an iterator of booleans. The iterator iterates over the rows of the right table.
     fn probe_exists<'a>(
         &'a self,
@@ -106,6 +141,20 @@ impl ProbeState {
         record_batch: &'a RecordBatch,
     ) -> DaftResult<impl Iterator<Item = bool> + 'a> {
         self.probeable.probe_exists(record_batch)
+    }
+
+    pub fn probe_indices_vec(
+        &self,
+        record_batch: &RecordBatch,
+    ) -> DaftResult<Vec<(u32, u64, u64)>> {
+        self.probeable.probe_indices_vec(record_batch)
+    }
+
+    pub fn probe_indices_vec_none(
+        &self,
+        record_batch: &RecordBatch,
+    ) -> DaftResult<Vec<(u32, Option<(u64, u64)>)>> {
+        self.probeable.probe_indices_vec_none(record_batch)
     }
 
     /// Returns an iterator of optional iterators.

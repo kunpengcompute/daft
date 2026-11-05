@@ -134,12 +134,10 @@ impl AntiSemiProbeSink {
         let _loop = info_span!("AntiSemiOperator::eval_and_probe").entered();
         for table in input.record_batches() {
             let join_keys = table.eval_expression_list(probe_on)?;
-            let idx_iter = probe_state.probe_indices(&join_keys)?;
+            let matches = probe_state.probe_indices_vec(&join_keys)?;
 
-            for inner_iter in idx_iter.flatten() {
-                for (build_table_idx, build_row_idx) in inner_iter {
-                    bitmap_builder.mark_used(build_table_idx as usize, build_row_idx as usize);
-                }
+            for (_, build_table_idx, build_row_idx) in matches {
+                bitmap_builder.mark_used(build_table_idx as usize, build_row_idx as usize);
             }
         }
         Ok(())

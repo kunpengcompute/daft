@@ -5,7 +5,7 @@ use common_metrics::ops::NodeType;
 use daft_core::prelude::{SchemaRef, UInt64Array};
 use daft_dsl::expr::bound_expr::BoundExpr;
 use daft_micropartition::MicroPartition;
-use daft_recordbatch::{GrowableRecordBatch, ProbeState, get_columns_by_name};
+use daft_recordbatch::{GrowableRecordBatch, ProbeState, RecordBatch, get_columns_by_name};
 use indexmap::IndexSet;
 use itertools::Itertools;
 use tracing::{Span, instrument};
@@ -94,38 +94,82 @@ impl InnerHashJoinProbeOperator {
         build_on_left: bool,
         output_schema: &SchemaRef,
     ) -> DaftResult<Arc<MicroPartition>> {
-        let build_side_tables = probe_state.get_record_batches().iter().collect::<Vec<_>>();
-
         let input_tables = input.record_batches();
         let result_tables = input_tables
             .iter()
             .map(|input_table| {
-                let mut build_side_growable = GrowableRecordBatch::new(
-                    &build_side_tables,
-                    false,
-                    Self::DEFAULT_GROWABLE_SIZE,
-                )?;
-                let mut probe_side_idxs = Vec::new();
+                const SMALL_THRESHOLD: usize = 1024;
 
                 let join_keys = input_table.eval_expression_list(probe_on)?;
-                let idx_iter = probe_state.probe_indices(&join_keys)?;
-                for (probe_row_idx, inner_iter) in idx_iter.enumerate() {
-                    if let Some(inner_iter) = inner_iter {
-                        for (build_rb_idx, build_row_idx) in inner_iter {
-                            build_side_growable.extend(
-                                build_rb_idx as usize,
-                                build_row_idx as usize,
-                                1,
-                            );
-                            probe_side_idxs.push(probe_row_idx as u64);
-                        }
-                    }
-                }
+                let matches = probe_state.probe_indices_vec(&join_keys)?;
+                let matches_len = matches.len();
 
-                let build_side_table = build_side_growable.build()?;
-                let probe_side_table = {
-                    let indices_arr = UInt64Array::from(("", probe_side_idxs));
-                    input_table.take(&indices_arr)?
+                let probe_rows = input_table.len().max(1);
+                let fanout = matches_len as f64 / probe_rows as f64;
+
+                let use_batch = matches_len >= SMALL_THRESHOLD && fanout >= 3.0;
+
+                let (build_side_table, probe_side_table) = if use_batch {
+                    // Take the build rows table-by-table, then concatenate. Probe indices
+                    // are grouped in the same per-table order so that pairing between the
+                    // concatenated build rows and the taken probe rows is preserved.
+                    let build_tables = probe_state.get_record_batches();
+                    let mut per_table_row_indices = vec![Vec::new(); build_tables.len()];
+                    let mut per_table_probe_indices = vec![Vec::new(); build_tables.len()];
+
+                    for (probe_idx, rb_idx, row_idx) in matches {
+                        per_table_row_indices[rb_idx as usize].push(row_idx);
+                        per_table_probe_indices[rb_idx as usize].push(probe_idx as u64);
+                    }
+
+                    let mut build_side_tables = Vec::new();
+                    let mut probe_side_idxs = Vec::with_capacity(matches_len);
+                    for ((row_indices, probe_indices), table) in per_table_row_indices
+                        .into_iter()
+                        .zip(per_table_probe_indices)
+                        .zip(build_tables.iter())
+                    {
+                        if row_indices.is_empty() {
+                            continue;
+                        }
+                        let idx_arr = UInt64Array::from(("", row_indices));
+                        build_side_tables.push(table.take(&idx_arr)?);
+                        probe_side_idxs.extend(probe_indices);
+                    }
+
+                    let build_side_table = if build_side_tables.len() == 1 {
+                        build_side_tables.pop().unwrap()
+                    } else {
+                        RecordBatch::concat(&build_side_tables)?
+                    };
+
+                    let probe_side_table = {
+                        let indices_arr = UInt64Array::from(("", probe_side_idxs));
+                        input_table.take(&indices_arr)?
+                    };
+                    (build_side_table, probe_side_table)
+                } else {
+                    let build_side_tables =
+                        probe_state.get_record_batches().iter().collect::<Vec<_>>();
+
+                    let mut build_side_growable = GrowableRecordBatch::new(
+                        &build_side_tables,
+                        false,
+                        matches_len.max(Self::DEFAULT_GROWABLE_SIZE),
+                    )?;
+                    let mut probe_side_idxs = Vec::with_capacity(matches_len);
+
+                    for (probe_idx, rb_idx, row_idx) in matches {
+                        build_side_growable.extend(rb_idx as usize, row_idx as usize, 1);
+                        probe_side_idxs.push(probe_idx as u64);
+                    }
+
+                    let build_side_table = build_side_growable.build()?;
+                    let probe_side_table = {
+                        let indices_arr = UInt64Array::from(("", probe_side_idxs));
+                        input_table.take(&indices_arr)?
+                    };
+                    (build_side_table, probe_side_table)
                 };
 
                 let (left_table, right_table) = if build_on_left {

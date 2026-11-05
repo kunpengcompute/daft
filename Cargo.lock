@@ -7738,8 +7738,7 @@ dependencies = [
 [[package]]
 name = "snap"
 version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b6b67fb9a61334225b5b790716f609cd58395f895b3fe8b328786812a40bc3b"
+source = "git+https://gitcode.com/xuanwu/snap.git?branch=kunpeng-dev#f4910e06a68fc74770288b35f1e6da3a3a5c924e"
 
 [[package]]
 name = "socket2"
